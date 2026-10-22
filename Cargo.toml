@@ -3,6 +3,7 @@ name = "micdeck"
 version = "0.1.0"
 edition = "2021"
 description = "Mix selected application audio and the microphone into a virtual microphone"
+license = "MIT"
 
 [lib]
 name = "micdeck_lib"
