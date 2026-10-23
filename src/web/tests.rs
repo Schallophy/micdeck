@@ -256,6 +256,13 @@ fn the_hotkey_route_keeps_one_canonical_spelling_and_refuses_nonsense() {
     let stored = std::fs::read_to_string(&path).unwrap();
     assert!(stored.contains("\"hotkey\": \"Ctrl+Shift+F8\""), "{stored}");
 
+    // A lone side-specific modifier is a tap binding; the spelling it keeps names the side.
+    let response = api::route(&engine, &settings, "POST", "/api/hotkey", r#"{"hotkey":"rctrl"}"#);
+    assert_eq!(response.status, 200);
+    assert_eq!(json(&response)["hotkey"], serde_json::json!("RCtrl"));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(stored.contains("\"hotkey\": \"RCtrl\""), "{stored}");
+
     // A chord the parser does not know is refused before anything is written.
     let response = api::route(
         &engine,
@@ -267,7 +274,7 @@ fn the_hotkey_route_keeps_one_canonical_spelling_and_refuses_nonsense() {
     assert_eq!(response.status, 400);
     assert_eq!(
         json(&api::route(&engine, &settings, "GET", "/api/hotkey", ""))["hotkey"],
-        serde_json::json!("Ctrl+Shift+F8")
+        serde_json::json!("RCtrl")
     );
 
     // The empty string is the explicit "no shortcut"; a body that omits the field is not.

@@ -415,13 +415,9 @@ fn dispatch(
     }
     if method == "POST" && path == "/api/mic/mute" {
         let request: MicMuteRequest = from_json(body)?;
-        if engine.set_mic_muted(request.muted) {
-            if request.muted {
-                crate::cue::muted();
-            } else {
-                crate::cue::unmuted();
-            }
-        }
+        // Silent on purpose: the page shows the state it just set, so the cue belongs to the global
+        // shortcut alone (a click is already visible feedback, and a beep would double it).
+        engine.set_mic_muted(request.muted);
         let mut settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         settings.set_mic_muted(request.muted);
         return Ok(ok());

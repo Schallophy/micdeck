@@ -53,6 +53,7 @@ use crate::engine::Engine;
 use crate::log;
 use crate::platform::brand;
 use crate::settings::Settings;
+use crate::tap;
 use crate::web;
 
 /// The callback message the shell posts when the icon is touched.
@@ -78,6 +79,9 @@ const ITEM_MUTE: usize = 4;
 
 /// `RegisterHotKey` ids are per window, not global; one is all this process needs.
 const HOTKEY_ID: i32 = 1;
+/// While a modifier tap is bound, this fine timer watches the key; see [`crate::tap`].
+const TAP_TIMER: usize = 2;
+const TAP_TICK_MS: u32 = 15;
 
 const CLASS: &str = "MicDeckTray";
 
@@ -130,6 +134,8 @@ struct Tray {
     /// The chord Windows actually accepted, if any. `None` covers "no shortcut", a chord another
     /// program owns, and a store that could not be parsed.
     hotkey: Option<crate::hotkey::Binding>,
+    /// The state behind a modifier-tap binding: inert unless the binding is a lone modifier.
+    tap: tap::Machine,
     /// Event codes the shell has already been seen reporting, so an unknown one is diagnosed once rather
     /// than on every mouse move.
     seen_events: std::collections::HashSet<u32>,
@@ -287,7 +293,7 @@ pub fn run(
         .hotkey
         .clone();
     let hotkey = match crate::hotkey::parse(&stored) {
-        Ok(Some(binding)) => match unsafe { register(hwnd, binding) } {
+        Ok(Some(binding)) => match unsafe { install(hwnd, Some(binding)) } {
             Ok(()) => {
                 log::line(&format!("tray: hotkey {} registered", binding.label()));
                 Some(binding)
@@ -328,6 +334,10 @@ pub fn run(
         running,
         muted,
         hotkey,
+        tap: tap::Machine::new(match hotkey {
+            Some(crate::hotkey::Binding::Tap(key)) => Some(key),
+            _ => None,
+        }),
         seen_events: std::collections::HashSet::new(),
         last_click: None,
     });
@@ -378,12 +388,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         REBIND_MESSAGE => apply_rebind(),
         WM_MEASUREITEM => measure_item(lparam),
         WM_DRAWITEM => draw_item(lparam),
-        WM_TIMER => tick(),
+        WM_TIMER => match wparam.0 as usize {
+            TIMER => tick(),
+            TAP_TIMER => tap_tick(),
+            _ => {}
+        },
         WM_SETTINGCHANGE => refresh_theme(),
         // The id in `wParam` is what tells several hotkeys on one window apart; this window owns one.
-        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => toggle_mute(),
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => toggle_mute(true),
         WM_DESTROY => unsafe {
             let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            let _ = KillTimer(Some(hwnd), TAP_TIMER);
             PostQuitMessage(0);
         },
         _ => {}
@@ -498,7 +513,7 @@ fn show_menu(hwnd: HWND) {
     };
     match command {
         ITEM_OPEN => open_page(),
-        ITEM_MUTE => toggle_mute(),
+        ITEM_MUTE => toggle_mute(false),
         ITEM_RESTART => restart_engine(),
         ITEM_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
@@ -514,15 +529,37 @@ fn restart_engine() {
     log::line("tray: engine restarted");
 }
 
-/// `MOD_NOREPEAT` makes holding the chord one toggle, not a stream of them.
-unsafe fn register(hwnd: HWND, binding: crate::hotkey::Binding) -> Result<(), String> {
-    RegisterHotKey(
-        Some(hwnd),
-        HOTKEY_ID,
-        HOT_KEY_MODIFIERS(binding.mods | MOD_NOREPEAT.0),
-        binding.vk,
-    )
-    .map_err(|err| err.to_string())
+/// Puts a binding into force. Chords stay with `RegisterHotKey` — `MOD_NOREPEAT` makes holding the
+/// chord one toggle, not a stream of them. A modifier tap cannot be a hot key (Windows accepts the
+/// registration of a bare modifier and then never delivers it), so a fine timer watches the key.
+unsafe fn install(hwnd: HWND, binding: Option<crate::hotkey::Binding>) -> Result<(), String> {
+    match binding {
+        Some(crate::hotkey::Binding::Chord { mods, vk }) => {
+            let _ = KillTimer(Some(hwnd), TAP_TIMER);
+            RegisterHotKey(
+                Some(hwnd),
+                HOTKEY_ID,
+                HOT_KEY_MODIFIERS(mods | MOD_NOREPEAT.0),
+                vk,
+            )
+            .map_err(|err| err.to_string())
+        }
+        Some(crate::hotkey::Binding::Tap(key)) => {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            SetTimer(Some(hwnd), TAP_TIMER, TAP_TICK_MS, None);
+            log::line(&format!(
+                "tray: tap watch on {} ({} ms poll)",
+                key.label(),
+                TAP_TICK_MS
+            ));
+            Ok(())
+        }
+        None => {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            let _ = KillTimer(Some(hwnd), TAP_TIMER);
+            Ok(())
+        }
+    }
 }
 
 /// What happened to an edit that arrived over HTTP.
@@ -583,44 +620,73 @@ fn swap(tray: &mut Tray, hwnd: HWND, binding: Option<crate::hotkey::Binding>) ->
         return Rebind::Applied;
     }
     let previous = tray.hotkey;
-    unsafe {
-        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
-    }
-    let Some(binding) = binding else {
-        tray.hotkey = None;
-        log::line("tray: hotkey off");
-        return Rebind::Applied;
-    };
-    match unsafe { register(hwnd, binding) } {
+    match unsafe { install(hwnd, binding) } {
         Ok(()) => {
-            tray.hotkey = Some(binding);
-            log::line(&format!("tray: hotkey {} registered", binding.label()));
+            tray.hotkey = binding;
+            tray.tap.set_key(match binding {
+                Some(crate::hotkey::Binding::Tap(key)) => Some(key),
+                _ => None,
+            });
+            match binding {
+                Some(binding) => {
+                    log::line(&format!("tray: hotkey {} registered", binding.label()))
+                }
+                None => log::line("tray: hotkey off"),
+            }
             Rebind::Applied
         }
         Err(err) => {
             // A refused edit must not silently cost the user the shortcut they already had.
-            let restored = previous.filter(|previous| unsafe { register(hwnd, *previous) }.is_ok());
+            let restored = previous.filter(|previous| unsafe { install(hwnd, Some(*previous)) }.is_ok());
             tray.hotkey = restored;
+            tray.tap.set_key(match restored {
+                Some(crate::hotkey::Binding::Tap(key)) => Some(key),
+                _ => None,
+            });
             log::line(&format!(
                 "tray: hotkey {} REFUSED — {err}",
-                binding.label()
+                binding.map(|binding| binding.label()).unwrap_or_default()
             ));
             Rebind::Refused(err)
         }
     }
 }
 
+/// One poll of the tap key, on the thread that owns the window. A press only fires when no other
+/// input was seen for the whole hold, so Right Ctrl keeps its day job as a modifier.
+fn tap_tick() {
+    let fired = with(|tray| {
+        let Some(key) = tray.tap.key() else {
+            return false;
+        };
+        let down = tap::key_down(key);
+        let other = if down || tray.tap.holding() {
+            tap::other_down(key)
+        } else {
+            false
+        };
+        tray.tap.poll(down, other)
+    });
+    if fired == Some(true) {
+        toggle_mute(true);
+    }
+}
+
 /// The hotkey, the menu row and the page's switch are one action. The engine is the live truth; the
 /// store is written here so a hotkey toggle survives a restart exactly like the page's toggle does.
-fn toggle_mute() {
+/// `cue` is true only for the global shortcut: the page and the menu show the new state themselves,
+/// so the sound exists to confirm a toggle the user could not see.
+fn toggle_mute(cue: bool) {
     let Some((engine, settings)) = with(|tray| (tray.engine.clone(), tray.settings.clone())) else {
         return;
     };
     let muted = engine.toggle_mic_muted();
-    if muted {
-        crate::cue::muted();
-    } else {
-        crate::cue::unmuted();
+    if cue {
+        if muted {
+            crate::cue::muted();
+        } else {
+            crate::cue::unmuted();
+        }
     }
     settings
         .lock()

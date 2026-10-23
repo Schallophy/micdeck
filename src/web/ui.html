@@ -967,6 +967,7 @@ let hotkeyArmed = false;
 function disarmHotkey(){
   if (!hotkeyArmed) return;
   hotkeyArmed = false;
+  tapCandidate = null;
   $('hotkeyBtn').classList.remove('armed');
   paintHotkey(state.hotkey);
 }
@@ -1018,9 +1019,16 @@ $('hotkeyBtn').addEventListener('click', () => {
   hotkeyArmed = true;
   $('hotkeyBtn').classList.add('armed');
   $('hotkeyBtn').textContent = '请按快捷键…';
-  $('hotkeyBtn').title = '按 Esc 取消；直接按 Backspace 清除';
+  $('hotkeyBtn').title = '按 Esc 取消；Backspace 清除；左右 Ctrl/Alt/Shift/Win 单独按下再松开也可以';
 });
 $('hotkeyBtn').addEventListener('blur', disarmHotkey);
+// Side-specific modifiers are recorded on release, matching how the tray judges a tap: only if no
+// other key joined in between does the press count as the shortcut and not as a chord's first key.
+const MODIFIER_NAMES = {
+  ControlLeft:'LCtrl', ControlRight:'RCtrl', AltLeft:'LAlt', AltRight:'RAlt',
+  ShiftLeft:'LShift', ShiftRight:'RShift', MetaLeft:'LWin', MetaRight:'RWin'
+};
+let tapCandidate = null;
 window.addEventListener('keydown', e => {
   if (!hotkeyArmed || e.isComposing) return;
   e.preventDefault();
@@ -1028,11 +1036,29 @@ window.addEventListener('keydown', e => {
   if (e.key === 'Escape') { disarmHotkey(); return; }
   // A bare Backspace clears the shortcut; with a modifier it is a key like any other.
   if (e.code === 'Backspace' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+    tapCandidate = null;
     saveHotkey('');
     return;
   }
+  if (MODIFIER_NAMES[e.code]) {
+    const held = e.ctrlKey + e.altKey + e.shiftKey + e.metaKey;
+    if (tapCandidate === null && held === 1) {
+      tapCandidate = e.code;
+    } else {
+      tapCandidate = null;
+    }
+    return;
+  }
+  tapCandidate = null;
   const chord = chordOf(e);
   if (chord) saveHotkey(chord);
+}, true);
+window.addEventListener('keyup', e => {
+  if (tapCandidate && e.code === tapCandidate) {
+    const label = MODIFIER_NAMES[e.code];
+    tapCandidate = null;
+    if (hotkeyArmed && label) saveHotkey(label);
+  }
 }, true);
 
 (async function init(){
