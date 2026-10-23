@@ -30,15 +30,8 @@
        font:15px/1.55 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;}
   /* 只读界面：指针操作不应带走任何文字选区；输入框和报错文案仍要能选中复制。 */
   input[type=text],textarea,.banner{-webkit-user-select:text;user-select:text}
-  .wrap{max-width:1180px;margin:0 auto;padding:34px 24px 48px}
-  header{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:20px}
-  h1{font-size:23px;margin:0 0 4px;letter-spacing:.2px;font-weight:650}
-  .status{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}
-  .pill{display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:999px;
-        border:1px solid var(--line);background:var(--panel);font-size:13px;white-space:nowrap}
-  .pilldot{width:8px;height:8px;border-radius:50%;background:#a9a49a}
-  .pill.running .pilldot{background:var(--ok)} .pill.starting .pilldot{background:var(--warn)}
-  .pill.faulted .pilldot{background:var(--err)} .pill.disconnected .pilldot{background:var(--err)}
+  .wrap{max-width:1180px;margin:0 auto;padding:14px 24px 48px}
+  .recovery{display:flex;justify-content:flex-end;margin:-4px 0 16px}
   .grid{display:grid;grid-template-columns:minmax(470px,1.35fr) minmax(360px,1fr);gap:18px;align-items:start}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px}
   .card h2{font-size:13px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);
@@ -182,17 +175,11 @@
 </head>
 <body>
 <div class="wrap">
-  <header>
-    <div>
-      <h1>MicDeck</h1>
-    </div>
-    <div class="status">
-      <span class="pill" id="pill"><span class="pilldot"></span><span id="pillText">已停止</span></span>
-      <button class="btn primary" id="engineRestart">重启引擎</button>
-    </div>
-  </header>
-
   <div id="banners"></div>
+
+  <div class="recovery">
+    <button class="btn primary" id="engineRestart">重启引擎</button>
+  </div>
 
   <div class="grid">
     <div>
@@ -255,7 +242,7 @@ const HUES = [18, 172, 214, 42, 302, 96, 340, 262];
 const state = {
   running:false, sources:[], lines:[], outputs:[], status:null, previews:[],
   picker:[], pickerSig:'', pickerTimer:null,
-  restarting:false, connected:true, lastEventAt:0, busy:false, hotkey:'',
+  restarting:false, busy:false, hotkey:'',
   sig:'', lineSig:'', rows:new Map(), lineEls:new Map(), gainTimers:{}, gainDrafts:{}, micGainDraft:null, labelTimers:{}, labelDrafts:{}, lastBanners:''};
 // The page speaks the route table verbatim; only the wire changed. `api_request` answers with exactly
 // the JSON body the local server used to write, so a refused edit arrives as {error} rather than as a
@@ -805,38 +792,13 @@ $('addLine').onclick = async () => {
   await refreshState();
 };
 
-// --- status, meters, link ---------------------------------------------------------------------
+// --- status, meters ---------------------------------------------------------------------------
+// There is no connection to report any more: the engine is this process, and a page that is on screen
+// is by definition talking to it. What is left to surface is a fault, and the error banner does that.
 function paintStatus(){
-  const pill = $('pill');
-  if (!state.connected){
-    pill.className = 'pill disconnected';
-    pill.title = '后端未连接（MicDeck 进程未运行或端口不通）';
-    $('pillText').textContent = '未连接';
-    $('engineRestart').style.display = 'none';
-    return;
-  }
   const s = state.status || {};
-  pill.className = 'pill ' + (s.state || 'stopped');
-  const map = { stopped:'已停止', starting:'启动中', running:'已连接', faulted:'故障' };
-  $('pillText').textContent = map[s.state] || s.state || '已连接';
-  pill.title = s.error || '';
   // Restart is a recovery action, not an apply button: only surface it when something is wrong.
   $('engineRestart').style.display = (s.state === 'faulted' || state.restarting) ? '' : 'none';
-}
-
-function clearLevels(){
-  paint($('micBar'), 0, $('micHold'), 0);
-  for (const el of state.lineEls.values()) paint(el.querySelector('.fill.line'), 0, el.querySelector('.hold'), 0);
-  for (const el of state.rows.values()) paint(el.querySelector('.fill.app'), 0, el.querySelector('.hold'), 0);
-  for (const el of $('pickList').querySelectorAll('.prow')) paint(el.querySelector('.fill.pick'), 0, el.querySelector('.hold'), 0);
-}
-
-function setConnected(ok){
-  if (state.connected === ok) return;
-  state.connected = ok;
-  if (!ok) clearLevels();
-  else refreshHotkey();
-  paintStatus();
 }
 
 function setState(s){
@@ -868,31 +830,22 @@ function setState(s){
   }
 
   const banners = [];
-  if (!state.lines.length && state.connected)
+  if (!state.lines.length)
     banners.push('<div class="banner warn">尚未添加输出线路</div>');
   if (s.error) banners.push(`<div class="banner err">${escapeHtml(s.error)}</div>`);
   const bannerHtml = banners.join('');
   if (state.lastBanners !== bannerHtml) { state.lastBanners = bannerHtml; $('banners').innerHTML = bannerHtml; }
 }
 
-// The window is the app: there is no stale tab to detect and no build id to compare against, so the
-// heartbeat that used to carry both is gone. What is left to watch is whether the push loop delivers.
+// The window is the app, so there is no connection to watch: the page is on screen only while this
+// process is alive. Unsubscribing is still worth doing while hidden — see `startUiLoops`.
 let unlisten = null;
 let listening = false;
 function initEvents(){
-  state.lastEventAt = Date.now();
   listening = true;
   tauri.event.listen('state', ev => {
-    state.lastEventAt = Date.now();
     try { setState(ev.payload); } catch (e) {}
-    setConnected(true);
-  }).then(fn => { unlisten = fn; }).catch(() => { listening = false; setConnected(false); });
-}
-
-// A frozen engine keeps the window open but stops pushing; 33 Hz means a 3 s hole is real.
-function checkLink(){
-  if (!listening || !state.connected || !state.lastEventAt) return;
-  if (Date.now() - state.lastEventAt > 3000) setConnected(false);
+  }).then(fn => { unlisten = fn; }).catch(() => { listening = false; });
 }
 
 // Nothing is shown while the window is hidden, so nothing is worth computing: unsubscribing stops the
@@ -901,7 +854,7 @@ let uiTimers = [];
 function startUiLoops(){
   if (uiTimers.length) return;
   if (!listening) initEvents();
-  uiTimers.push(setInterval(() => { if (!listening) refreshState(); checkLink(); }, 1000));
+  uiTimers.push(setInterval(() => { if (!listening) refreshState(); }, 1000));
   uiTimers.push(setInterval(loadDevices, 15000));
 }
 function stopUiLoops(){
@@ -923,10 +876,8 @@ document.addEventListener('visibilitychange', () => {
 
 async function refreshState(){
   try {
-    const s = await getJson('/api/state');
-    setConnected(true);
-    setState(s);
-  } catch (e) { setConnected(false); }
+    setState(await getJson('/api/state'));
+  } catch (e) {}
 }
 
 $('engineRestart').onclick = async () => {
