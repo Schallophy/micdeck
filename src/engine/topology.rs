@@ -1079,6 +1079,8 @@ impl Engine {
         if !suspect {
             return;
         }
+        // The endpoint list is a COM walk of every capture device, so it runs outside the world lock:
+        // while a microphone stays missing, the UI's 30 ms snapshot would queue up behind each lookup.
         let mut world = self.world();
         if world.mic.device_id.is_empty() && world.mic.name.is_empty() {
             return;
@@ -1086,6 +1088,7 @@ impl Engine {
         let wanted_id = world.mic.device_id.clone();
         let wanted_name = world.mic.name.clone();
         self.close_mic(&mut world);
+        drop(world);
         let found = match platform::list_endpoints(Direction::Capture) {
             Ok(endpoints) => endpoints
                 .iter()
@@ -1094,6 +1097,12 @@ impl Engine {
                 .cloned(),
             Err(_) => None,
         };
+        let mut world = self.world();
+        // The selection is only ours to restore while nobody else has moved it.
+        let moved = world.mic.device_id != wanted_id || world.mic.name != wanted_name;
+        if moved || world.mic.capture.is_some() {
+            return;
+        }
         let Some(endpoint) = found else {
             // Still gone; the watchdog looks again in two seconds.
             world.mic.lost = true;
@@ -1295,23 +1304,45 @@ impl Engine {
     }
 
     /// Tries to attach every remembered source that is not running yet.
+    ///
+    /// The scan runs outside the world lock on purpose. `session_pids` walks every active render
+    /// endpoint's audio sessions over COM and `processes_named` snapshots the whole process list; with one
+    /// remembered source waiting for its app, that pair costs ~350 ms and it used to be paid holding the
+    /// lock — so every 2 s the UI's 30 ms snapshot queued up behind it and the meters visibly froze.
     pub fn reconnect_sources(&self) {
-        let mut world = self.world();
-        let pending: Vec<(u32, Identity)> = world
-            .wants
-            .iter()
-            .filter(|want| want.live.is_none())
-            .map(|want| (want.id, want.identity.clone()))
-            .collect();
+        let pending: Vec<(u32, Identity)> = {
+            let world = self.world();
+            world
+                .wants
+                .iter()
+                .filter(|want| want.live.is_none())
+                .map(|want| (want.id, want.identity.clone()))
+                .collect()
+        };
         if pending.is_empty() {
             return;
         }
         let sessions = platform::session_pids();
-        for (want_id, identity) in pending {
-            let candidates = platform::processes_named(identity.name.trim());
-            let Some(pid) = pick_candidate(&candidates, &identity, &sessions) else {
+        let found: Vec<(u32, Identity, u32)> = pending
+            .into_iter()
+            .filter_map(|(want_id, identity)| {
+                let candidates = platform::processes_named(identity.name.trim());
+                pick_candidate(&candidates, &identity, &sessions).map(|pid| (want_id, identity, pid))
+            })
+            .collect();
+        if found.is_empty() {
+            return;
+        }
+        let mut world = self.world();
+        for (want_id, identity, pid) in found {
+            // The user may have removed it, or another path may have attached it, while we were scanning.
+            let still_pending = world
+                .wants
+                .iter()
+                .any(|want| want.id == want_id && want.live.is_none());
+            if !still_pending {
                 continue;
-            };
+            }
             match self.attach_feed(&mut world, want_id, pid) {
                 Ok(()) => log::line(&format!(
                     "source reconnected: '{}' pid={pid}",
