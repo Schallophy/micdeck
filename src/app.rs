@@ -26,6 +26,11 @@ impl App {
         self.web.stopped_signal()
     }
 
+    /// The tray's hotkey writes the switch back to the store; it owns no settings of its own.
+    pub fn settings(&self) -> Arc<Mutex<Settings>> {
+        self.settings.clone()
+    }
+
     pub fn stop(&self) {
         self.web.stop();
         self.engine.stop();
@@ -114,6 +119,10 @@ fn restore(engine: &Arc<Engine>, settings: &Arc<Mutex<Settings>>) {
             }
         }
     }
+
+    // Before the capture opens, so a store that says "muted" never routes a live block first. A
+    // restored switch is not a user action, so this one does not play the cue.
+    let _ = engine.set_mic_muted(store.mic_muted);
 
     if !store.mic_id.is_empty() {
         if let Err(err) = engine.restore_mic(&store.mic_id, store.mic_gain) {

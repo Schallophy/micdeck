@@ -92,6 +92,7 @@ fn the_state_envelope_carries_every_key_the_page_reads() {
         "micId",
         "micName",
         "micGain",
+        "micMuted",
         "micLevel",
         "micHold",
         "micRoutes",
@@ -121,7 +122,14 @@ fn the_page_is_embedded_and_served_whole() {
     assert_eq!(response.content_type, "text/html; charset=utf-8");
     let text = String::from_utf8_lossy(&response.body).into_owned();
     assert!(text.len() > 20_000, "the embedded page is the real one");
-    for marker in ["/api/previews/start", "EventSource", "micDevice"] {
+    for marker in [
+        "/api/previews/start",
+        "EventSource",
+        "/api/mic/mute",
+        "hotkeyBtn",
+        "micToggle",
+        "micDevice",
+    ] {
         assert!(text.contains(marker), "the page should still use {marker}");
     }
     let _ = std::fs::remove_file(&path);
@@ -189,6 +197,85 @@ fn choosing_no_microphone_is_a_no_op_and_a_gain_change_is_not() {
     assert!(stored.contains("\"micId\": \"\""), "{stored}");
     assert!(stored.contains("\"micGain\": 0.5"), "{stored}");
     assert_eq!(engine.snapshot().mic_gain, 0.5);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_master_switch_is_reported_and_persisted() {
+    let engine = engine();
+    let (settings, path) = settings("mute");
+    let response = api::route(
+        &engine,
+        &settings,
+        "POST",
+        "/api/mic/mute",
+        r#"{"muted":true}"#,
+    );
+    assert_eq!(response.status, 200);
+    assert!(engine.snapshot().mic_muted, "the engine is the live truth");
+    let state = json(&api::route(&engine, &settings, "GET", "/api/state", ""));
+    assert_eq!(state["micMuted"], serde_json::json!(true));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(stored.contains("\"micMuted\": true"), "{stored}");
+
+    // An omitted switch must not be read as "unmute": the one field this route has is required.
+    let response = api::route(&engine, &settings, "POST", "/api/mic/mute", "{}");
+    assert_eq!(response.status, 400);
+    assert!(engine.snapshot().mic_muted, "a refused body changed nothing");
+
+    let response = api::route(
+        &engine,
+        &settings,
+        "POST",
+        "/api/mic/mute",
+        r#"{"muted":false}"#,
+    );
+    assert_eq!(response.status, 200);
+    assert!(!engine.snapshot().mic_muted);
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(stored.contains("\"micMuted\": false"), "{stored}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn the_hotkey_route_keeps_one_canonical_spelling_and_refuses_nonsense() {
+    let engine = engine();
+    let (settings, path) = settings("hotkey");
+    let value = json(&api::route(&engine, &settings, "GET", "/api/hotkey", ""));
+    assert_eq!(value["hotkey"], serde_json::json!("Ctrl+Alt+M"));
+
+    let response = api::route(
+        &engine,
+        &settings,
+        "POST",
+        "/api/hotkey",
+        r#"{"hotkey":"ctrl+shift+f8"}"#,
+    );
+    assert_eq!(response.status, 200);
+    assert_eq!(json(&response)["hotkey"], serde_json::json!("Ctrl+Shift+F8"));
+    let stored = std::fs::read_to_string(&path).unwrap();
+    assert!(stored.contains("\"hotkey\": \"Ctrl+Shift+F8\""), "{stored}");
+
+    // A chord the parser does not know is refused before anything is written.
+    let response = api::route(
+        &engine,
+        &settings,
+        "POST",
+        "/api/hotkey",
+        r#"{"hotkey":"Ctrl+Alt+Banana"}"#,
+    );
+    assert_eq!(response.status, 400);
+    assert_eq!(
+        json(&api::route(&engine, &settings, "GET", "/api/hotkey", ""))["hotkey"],
+        serde_json::json!("Ctrl+Shift+F8")
+    );
+
+    // The empty string is the explicit "no shortcut"; a body that omits the field is not.
+    let response = api::route(&engine, &settings, "POST", "/api/hotkey", r#"{"hotkey":""}"#);
+    assert_eq!(response.status, 200);
+    assert_eq!(json(&response)["hotkey"], serde_json::json!(""));
+    let response = api::route(&engine, &settings, "POST", "/api/hotkey", "{}");
+    assert_eq!(response.status, 400);
     let _ = std::fs::remove_file(&path);
 }
 

@@ -97,6 +97,8 @@ struct Mic {
     device_id: String,
     name: String,
     gain: f32,
+    /// Silences every line's microphone slot without stopping the capture.
+    muted: bool,
     ring: Arc<SourceRing>,
     capture: Option<Capture>,
     /// The selected device went away under the capture. The selection is kept and the watchdog looks again.
@@ -200,6 +202,7 @@ impl Engine {
                     device_id: String::new(),
                     name: String::new(),
                     gain: 1.0,
+                    muted: false,
                     ring,
                     capture: None,
                     lost: false,
@@ -259,6 +262,7 @@ impl Engine {
             status.mic_id = world.mic.device_id.clone();
             status.mic_name = world.mic.name.clone();
             status.mic_gain = world.mic.gain;
+            status.mic_muted = world.mic.muted;
             status.mic_level = world.mic.meter.level();
             status.mic_hold = world.mic.meter.hold();
             status.previews = world
@@ -427,8 +431,11 @@ impl Engine {
             }
         }
         if world.mic.lines.contains(&line.id) {
-            line.bus
-                .attach_source(world.mic.ring.clone(), MIC_FEED_ID, world.mic.gain);
+            line.bus.attach_source(
+                world.mic.ring.clone(),
+                MIC_FEED_ID,
+                mic_gain_for(&world.mic),
+            );
         }
         line.sink = Some(sink);
         line.device_id = endpoint.id.clone();
@@ -892,7 +899,7 @@ impl Engine {
 
     /// The gain belongs to the source; each line's reader is what has to be told about it.
     fn apply_mic_gain(&self, world: &mut World) {
-        let gain = world.mic.gain;
+        let gain = mic_gain_for(&world.mic);
         let lines = world.mic.lines.clone();
         for line in world.lines.iter_mut() {
             if lines.contains(&line.id) {
@@ -902,6 +909,46 @@ impl Engine {
     }
 
     // --- microphone --------------------------------------------------------------------------
+
+    /// The master switch: silence the microphone's slot on every line but keep the capture running.
+    /// Unmuting is instant, and the input meter keeps reporting what the hardware actually hears.
+    /// Returns whether the switch moved, because the caller's cue is only for a real change.
+    pub fn set_mic_muted(&self, muted: bool) -> bool {
+        let mut world = self.world();
+        if !Self::apply_mic_muted(&mut world, muted) {
+            return false;
+        }
+        drop(world);
+        log::line(if muted { "mic muted" } else { "mic unmuted" });
+        true
+    }
+
+    /// Returns the new state so the tray and the page can agree without a second read.
+    pub fn toggle_mic_muted(&self) -> bool {
+        let mut world = self.world();
+        let next = !world.mic.muted;
+        if Self::apply_mic_muted(&mut world, next) {
+            drop(world);
+            log::line(if next { "mic muted" } else { "mic unmuted" });
+        }
+        next
+    }
+
+    fn apply_mic_muted(world: &mut World, muted: bool) -> bool {
+        if world.mic.muted == muted {
+            return false;
+        }
+        world.mic.muted = muted;
+        let gain = mic_gain_for(&world.mic);
+        let lines = world.mic.lines.clone();
+        for line in world.lines.iter_mut() {
+            if lines.contains(&line.id) {
+                // The existing gain slew makes this a ~14 ms fade, not a step.
+                line.bus.set_gain(MIC_FEED_ID, gain);
+            }
+        }
+        true
+    }
 
     /// Selecting a microphone means capturing it: the meter moves whether or not a line carries it yet.
     pub fn set_mic(&self, selector: &str, gain: f32) -> Result<(), String> {
@@ -986,7 +1033,7 @@ impl Engine {
             if !attached {
                 world.mic.lines.push(line_id);
             }
-            let gain = world.mic.gain;
+            let gain = mic_gain_for(&world.mic);
             let ring = world.mic.ring.clone();
             let reopen = world.mic.capture.is_none() && !world.mic.device_id.is_empty();
             drop(world);
@@ -1397,6 +1444,15 @@ fn clamp_gain(gain: f32) -> f32 {
     gain.clamp(0.0, MAX_GAIN)
 }
 
+/// What every line's microphone slot should actually receive: the user's gain, or zero while muted.
+fn mic_gain_for(mic: &Mic) -> f32 {
+    if mic.muted {
+        0.0
+    } else {
+        mic.gain
+    }
+}
+
 /// Which of the same-named processes is the one the user routed: prefer the one holding an audio session,
 /// then the earliest started; a stored path is a stronger claim than a name, but is only used when both
 /// sides can read it.
@@ -1429,4 +1485,25 @@ fn pick_candidate(
         return with_signal.first().copied();
     }
     matched.first().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_master_switch_toggles_and_reaches_the_snapshot() {
+        let engine = Engine::start(Arc::new(crate::engine::SystemClock));
+        assert!(!engine.snapshot().mic_muted, "a new engine is open");
+        assert!(engine.toggle_mic_muted(), "the first toggle mutes");
+        assert!(engine.snapshot().mic_muted);
+        assert!(!engine.toggle_mic_muted(), "the second toggle opens it again");
+        assert!(!engine.snapshot().mic_muted);
+
+        // The setter is idempotent and the snapshot gives the same answer.
+        engine.set_mic_muted(true);
+        engine.set_mic_muted(true);
+        assert!(engine.snapshot().mic_muted);
+        engine.stop();
+    }
 }

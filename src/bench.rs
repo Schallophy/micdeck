@@ -600,9 +600,13 @@ fn web_server(
     if tray {
         #[cfg(windows)]
         {
-            if let Err(err) =
-                crate::tray::run(app.engine.clone(), app.url(), app.web_stopped(), limit)
-            {
+            if let Err(err) = crate::tray::run(
+                app.engine.clone(),
+                app.settings(),
+                app.url(),
+                app.web_stopped(),
+                limit,
+            ) {
                 line(&format!("tray failed: {err}"));
                 code = EXIT_TRAY;
             }

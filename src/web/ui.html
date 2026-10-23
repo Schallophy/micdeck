@@ -128,6 +128,12 @@
   .mbtn:hover{background:var(--hover)}
   .mbtn.on{background:var(--accent);border-color:var(--accent);color:var(--accent-ink)}
   .mbtn.on:hover{background:var(--accent)}
+  .mbtn:disabled{opacity:.4;cursor:not-allowed}
+  .mbtn:disabled:hover{background:var(--panel)}
+  /* The mute chord: a button because clicking it starts recording, not a static label. */
+  .btn.hk{flex:0 0 auto;margin-left:auto;font:11.5px var(--mono);letter-spacing:0;text-transform:none;padding:4px 8px}
+  .hk.armed{border-color:var(--accent);color:var(--accent);background:var(--hover)}
+  .card.muted .meter{opacity:.35}
   .pool{min-height:46px;border:1.5px dashed var(--line);border-radius:10px;padding:7px;margin-top:10px;
         display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start}
   .pool.drop{border-color:var(--accent);border-style:solid;background:var(--hover)}
@@ -190,8 +196,11 @@
 
   <div class="grid">
     <div>
-      <section class="card">
-        <h2>麦克风</h2>
+      <section class="card" id="micCard">
+        <h2>麦克风
+          <button class="btn ghost hk" id="hotkeyBtn" title="麦克风开关快捷键（点击修改）"></button>
+          <button class="mbtn" id="micToggle" aria-label="麦克风开关" aria-pressed="true"></button>
+        </h2>
         <div class="row">
           <select id="micDevice"></select>
           <span class="gv" id="micGainVal">0.0 dB</span>
@@ -246,7 +255,7 @@ const HUES = [18, 172, 214, 42, 302, 96, 340, 262];
 const state = {
   running:false, sources:[], lines:[], outputs:[], status:null, previews:[],
   picker:[], pickerSig:'', pickerTimer:null,
-  restarting:false, connected:true, lastEventAt:0, busy:false,
+  restarting:false, connected:true, lastEventAt:0, busy:false, hotkey:'',
   sig:'', lineSig:'', rows:new Map(), lineEls:new Map(), gainTimers:{}, gainDrafts:{}, micGainDraft:null, labelTimers:{}, labelDrafts:{}, lastBanners:''};
 async function getJson(url){ const r = await fetch(url); return r.json(); }
 async function post(url, body){
@@ -800,6 +809,7 @@ function setConnected(ok){
   if (state.connected === ok) return;
   state.connected = ok;
   if (!ok) clearLevels();
+  else refreshHotkey();
   paintStatus();
 }
 
@@ -816,6 +826,12 @@ function setState(s){
   renderApps();
   paintPicker();
   paint($('micBar'), s.micLevel, $('micHold'), s.micHold);
+  const micOn = !!s.micId && !s.micMuted;
+  $('micCard').classList.toggle('muted', !!s.micMuted);
+  $('micToggle').classList.toggle('on', micOn);
+  $('micToggle').disabled = !s.micId;
+  $('micToggle').title = !s.micId ? '未选择麦克风' : (micOn ? '关闭麦克风' : '开启麦克风');
+  $('micToggle').setAttribute('aria-pressed', micOn ? 'true' : 'false');
 
   if (s.micId && document.activeElement !== $('micDevice')) $('micDevice').value = s.micId;
   if (document.activeElement !== $('micGain') && state.micGainDraft === null){
@@ -936,8 +952,91 @@ $('micGain').addEventListener('input', e => {
 $('micDevice').addEventListener('change', () => {
   post('/api/mic', { deviceId: $('micDevice').value || '', gain: dbToGain(Number($('micGain').value)) });
 });
+$('micToggle').addEventListener('click', () => {
+  const on = !!state.status && !!state.status.micId && !state.status.micMuted;
+  post('/api/mic/mute', { muted: on }).catch(() => {});
+});
+
+// The shortcut is a stored setting, not telemetry: fetched once, and every edit answers with the
+// canonical spelling the store kept.
+function paintHotkey(text){
+  $('hotkeyBtn').textContent = text || '设置快捷键';
+  $('hotkeyBtn').title = text ? `麦克风开关快捷键：${text}（点击修改）` : '未设置麦克风开关快捷键（点击设置）';
+}
+let hotkeyArmed = false;
+function disarmHotkey(){
+  if (!hotkeyArmed) return;
+  hotkeyArmed = false;
+  $('hotkeyBtn').classList.remove('armed');
+  paintHotkey(state.hotkey);
+}
+// Physical keys, not characters: Shift must not turn the recorded chord into a symbol, and a Chinese
+// IME must not sit between the user and the key they pressed.
+function keyName(code){
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(code))) return m[1];
+  if ((m = /^Digit([0-9])$/.exec(code))) return m[1];
+  if ((m = /^F([1-9]|1[0-9]|2[0-4])$/.exec(code))) return 'F' + m[1];
+  return {
+    ArrowUp:'Up', ArrowDown:'Down', ArrowLeft:'Left', ArrowRight:'Right',
+    Space:'Space', Enter:'Enter', Tab:'Tab', Backspace:'Backspace',
+    Insert:'Insert', Delete:'Delete', Home:'Home', End:'End',
+    PageUp:'PageUp', PageDown:'PageDown', Pause:'Pause',
+    ScrollLock:'ScrollLock', PrintScreen:'PrintScreen'
+  }[code] || null;
+}
+function chordOf(e){
+  const mods = [];
+  if (e.ctrlKey) mods.push('Ctrl');
+  if (e.altKey) mods.push('Alt');
+  if (e.shiftKey) mods.push('Shift');
+  if (e.metaKey) mods.push('Win');
+  const key = keyName(e.code);
+  return key ? mods.concat(key).join('+') : null;
+}
+async function refreshHotkey(){
+  try {
+    const r = await getJson('/api/hotkey');
+    state.hotkey = r.hotkey || '';
+    if (!hotkeyArmed) paintHotkey(state.hotkey);
+  } catch (e) {}
+}
+async function saveHotkey(chord){
+  hotkeyArmed = false;
+  $('hotkeyBtn').classList.remove('armed');
+  try {
+    const res = await post('/api/hotkey', { hotkey: chord });
+    if (res.error) { alert(res.error); paintHotkey(state.hotkey); return; }
+    state.hotkey = res.hotkey || '';
+    paintHotkey(state.hotkey);
+  } catch (e) {
+    alert('快捷键没有保存');
+    paintHotkey(state.hotkey);
+  }
+}
+$('hotkeyBtn').addEventListener('click', () => {
+  hotkeyArmed = true;
+  $('hotkeyBtn').classList.add('armed');
+  $('hotkeyBtn').textContent = '请按快捷键…';
+  $('hotkeyBtn').title = '按 Esc 取消；直接按 Backspace 清除';
+});
+$('hotkeyBtn').addEventListener('blur', disarmHotkey);
+window.addEventListener('keydown', e => {
+  if (!hotkeyArmed || e.isComposing) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (e.key === 'Escape') { disarmHotkey(); return; }
+  // A bare Backspace clears the shortcut; with a modifier it is a key like any other.
+  if (e.code === 'Backspace' && !e.ctrlKey && !e.altKey && !e.shiftKey && !e.metaKey) {
+    saveHotkey('');
+    return;
+  }
+  const chord = chordOf(e);
+  if (chord) saveHotkey(chord);
+}, true);
 
 (async function init(){
+  $('micToggle').innerHTML = MIC_SVG;
   const mic = $('micDevice');
   mic.innerHTML = '<option value="">不使用麦克风</option>';
   try {
@@ -947,6 +1046,7 @@ $('micDevice').addEventListener('change', () => {
     state.outputs = d.outputs || [];
   } catch (e) {}
   renderDeviceLists();
+  await refreshHotkey();
   await refreshState();
   paintGainFill($('micGain'));
   window.addEventListener('resize', () => {

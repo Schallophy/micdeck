@@ -30,7 +30,9 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
     SystemParametersInfoForDpi,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetDoubleClickTime, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
+};
 use windows::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NIM_SETVERSION, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
@@ -42,18 +44,21 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MNS_NOCHECK, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW,
     SetForegroundWindow, SetMenuInfo, SetTimer, SPI_GETNONCLIENTMETRICS, TPM_BOTTOMALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CONTEXTMENU,
-    WM_DESTROY, WM_DRAWITEM, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_NULL,
-    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_EX_TOOLWINDOW,
-    WS_POPUP,
+    WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE,
+    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::engine::Engine;
 use crate::log;
 use crate::platform::brand;
+use crate::settings::Settings;
 use crate::web;
 
 /// The callback message the shell posts when the icon is touched.
 const ICON_MESSAGE: u32 = WM_APP + 1;
+/// A chord edit from the web thread, to be applied on the thread that owns the window.
+const REBIND_MESSAGE: u32 = WM_APP + 2;
 const TIMER: usize = 1;
 const TICK_MS: u32 = 500;
 
@@ -69,6 +74,10 @@ const NIN_INNERRIGHTCLICK: u32 = 1032;
 const ITEM_OPEN: usize = 1;
 const ITEM_RESTART: usize = 2;
 const ITEM_EXIT: usize = 3;
+const ITEM_MUTE: usize = 4;
+
+/// `RegisterHotKey` ids are per window, not global; one is all this process needs.
+const HOTKEY_ID: i32 = 1;
 
 const CLASS: &str = "MicDeckTray";
 
@@ -104,6 +113,7 @@ struct Item {
 struct Tray {
     hwnd: isize,
     engine: Arc<Engine>,
+    settings: Arc<Mutex<Settings>>,
     url: String,
     /// The accept loop's own "I stopped" flag: when it goes, the product has nothing left to serve.
     stopped: Arc<AtomicBool>,
@@ -116,6 +126,10 @@ struct Tray {
     items: Vec<Item>,
     dark: bool,
     running: bool,
+    muted: bool,
+    /// The chord Windows actually accepted, if any. `None` covers "no shortcut", a chord another
+    /// program owns, and a store that could not be parsed.
+    hotkey: Option<crate::hotkey::Binding>,
     /// Event codes the shell has already been seen reporting, so an unknown one is diagnosed once rather
     /// than on every mouse move.
     seen_events: std::collections::HashSet<u32>,
@@ -129,6 +143,16 @@ struct Tray {
 /// window procedure has no way to capture anything else.
 static TRAY: LazyLock<Mutex<Option<Tray>>> = LazyLock::new(|| Mutex::new(None));
 
+type RebindJob = (
+    Option<crate::hotkey::Binding>,
+    std::sync::mpsc::Sender<Rebind>,
+);
+
+/// An edit waiting for the tray thread. `RegisterHotKey` is owned by the thread that created the
+/// window — another thread gets `ERROR_INVALID_WINDOW_HANDLE` — so the web thread leaves the request
+/// here, posts a message, and waits for the answer.
+static REBIND_JOB: LazyLock<Mutex<Option<RebindJob>>> = LazyLock::new(|| Mutex::new(None));
+
 fn with<T>(body: impl FnOnce(&mut Tray) -> T) -> Option<T> {
     let mut guard = TRAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     guard.as_mut().map(body)
@@ -141,6 +165,7 @@ fn hwnd_of(value: isize) -> HWND {
 /// Runs the tray until its menu says quit, the web server stops, or `limit_seconds` elapses.
 pub fn run(
     engine: Arc<Engine>,
+    settings: Arc<Mutex<Settings>>,
     url: &str,
     stopped: Arc<AtomicBool>,
     limit_seconds: Option<f64>,
@@ -151,12 +176,19 @@ pub fn run(
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
+    let status = engine.snapshot();
+    let running = status.running;
+    let muted = status.mic_muted;
     let icon = brand::hicon().ok_or_else(|| "could not build the tray icon".to_string())?;
     let menu = unsafe { CreatePopupMenu() }.map_err(|err| format!("popup menu: {err}"))?;
     let items = vec![
         Item {
             id: ITEM_OPEN,
             label: wide("打开 MicDeck"),
+        },
+        Item {
+            id: ITEM_MUTE,
+            label: mute_label(muted),
         },
         Item {
             id: ITEM_RESTART,
@@ -174,7 +206,6 @@ pub fn run(
         }
     }
 
-    let running = engine.snapshot().running;
     let class = wide(CLASS);
     let instance = unsafe { GetModuleHandleW(PCWSTR::null()) }
         .map_err(|err| format!("module handle: {err}"))?;
@@ -248,11 +279,43 @@ pub fn run(
         }
     ));
 
+    // A taken chord degrades the feature, not the product: the menu item and the page's switch still
+    // toggle the same state, so a refusal is a log line, not a startup failure.
+    let stored = settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .hotkey
+        .clone();
+    let hotkey = match crate::hotkey::parse(&stored) {
+        Ok(Some(binding)) => match unsafe { register(hwnd, binding) } {
+            Ok(()) => {
+                log::line(&format!("tray: hotkey {} registered", binding.label()));
+                Some(binding)
+            }
+            Err(err) => {
+                log::line(&format!(
+                    "tray: hotkey {} REFUSED — {err}",
+                    binding.label()
+                ));
+                None
+            }
+        },
+        Ok(None) => {
+            log::line("tray: hotkey off");
+            None
+        }
+        Err(err) => {
+            log::line(&format!("tray: hotkey '{stored}' ignored: {err}"));
+            None
+        }
+    };
+
     let font = menu_font(hwnd);
     let deadline = limit_seconds.map(|seconds| Instant::now() + Duration::from_secs_f64(seconds));
     *TRAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Tray {
         hwnd: hwnd.0 as isize,
         engine,
+        settings,
         url: url.to_string(),
         stopped,
         deadline,
@@ -263,6 +326,8 @@ pub fn run(
         items,
         dark,
         running,
+        muted,
+        hotkey,
         seen_events: std::collections::HashSet::new(),
         last_click: None,
     });
@@ -310,11 +375,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     // handled whole and a failure costs one ignored message.
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
         ICON_MESSAGE => icon_message(hwnd, wparam, lparam),
+        REBIND_MESSAGE => apply_rebind(),
         WM_MEASUREITEM => measure_item(lparam),
         WM_DRAWITEM => draw_item(lparam),
         WM_TIMER => tick(),
         WM_SETTINGCHANGE => refresh_theme(),
-        WM_DESTROY => unsafe { PostQuitMessage(0) },
+        // The id in `wParam` is what tells several hotkeys on one window apart; this window owns one.
+        WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => toggle_mute(),
+        WM_DESTROY => unsafe {
+            let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+            PostQuitMessage(0);
+        },
         _ => {}
     }));
     if outcome.is_err() {
@@ -427,6 +498,7 @@ fn show_menu(hwnd: HWND) {
     };
     match command {
         ITEM_OPEN => open_page(),
+        ITEM_MUTE => toggle_mute(),
         ITEM_RESTART => restart_engine(),
         ITEM_EXIT => unsafe {
             let _ = DestroyWindow(hwnd);
@@ -440,6 +512,140 @@ fn restart_engine() {
     let Some(engine) = with(|tray| tray.engine.clone()) else { return };
     engine.restart_all_lines();
     log::line("tray: engine restarted");
+}
+
+/// `MOD_NOREPEAT` makes holding the chord one toggle, not a stream of them.
+unsafe fn register(hwnd: HWND, binding: crate::hotkey::Binding) -> Result<(), String> {
+    RegisterHotKey(
+        Some(hwnd),
+        HOTKEY_ID,
+        HOT_KEY_MODIFIERS(binding.mods | MOD_NOREPEAT.0),
+        binding.vk,
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// What happened to an edit that arrived over HTTP.
+pub enum Rebind {
+    /// The window now holds the new chord, or holds none.
+    Applied,
+    /// No tray in this process: the store remembers the chord for the next tray start.
+    NoTray,
+    /// Windows refused it; the previous chord is still in force, and the message says why.
+    Refused(String),
+}
+
+/// Asks the tray thread to swap the registration in place, and waits for its answer so a refused chord
+/// never reaches the store. The page is the editor; edits are rare enough for a round trip.
+pub fn rebind(binding: Option<crate::hotkey::Binding>) -> Rebind {
+    let Some(hwnd) = with(|tray| tray.hwnd) else {
+        return Rebind::NoTray;
+    };
+    let hwnd = hwnd_of(hwnd);
+    let (reply, answer) = std::sync::mpsc::channel();
+    *REBIND_JOB
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some((binding, reply));
+    if unsafe { PostMessageW(Some(hwnd), REBIND_MESSAGE, WPARAM(0), LPARAM(0)) }.is_err() {
+        *REBIND_JOB
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        return Rebind::NoTray;
+    }
+    match answer.recv_timeout(Duration::from_secs(2)) {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            // Drop the job so a late message cannot apply an edit the caller was told failed.
+            *REBIND_JOB
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+            Rebind::Refused("托盘没有响应".to_string())
+        }
+    }
+}
+
+/// Runs on the tray thread: `WM_HOTKEY` and the registration live on the same thread, so a swap
+/// cannot race the message that triggers it.
+fn apply_rebind() {
+    let Some((binding, reply)) = REBIND_JOB
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let outcome = with(|tray| swap(tray, hwnd_of(tray.hwnd), binding)).unwrap_or(Rebind::NoTray);
+    let _ = reply.send(outcome);
+}
+
+fn swap(tray: &mut Tray, hwnd: HWND, binding: Option<crate::hotkey::Binding>) -> Rebind {
+    if tray.hotkey == binding {
+        return Rebind::Applied;
+    }
+    let previous = tray.hotkey;
+    unsafe {
+        let _ = UnregisterHotKey(Some(hwnd), HOTKEY_ID);
+    }
+    let Some(binding) = binding else {
+        tray.hotkey = None;
+        log::line("tray: hotkey off");
+        return Rebind::Applied;
+    };
+    match unsafe { register(hwnd, binding) } {
+        Ok(()) => {
+            tray.hotkey = Some(binding);
+            log::line(&format!("tray: hotkey {} registered", binding.label()));
+            Rebind::Applied
+        }
+        Err(err) => {
+            // A refused edit must not silently cost the user the shortcut they already had.
+            let restored = previous.filter(|previous| unsafe { register(hwnd, *previous) }.is_ok());
+            tray.hotkey = restored;
+            log::line(&format!(
+                "tray: hotkey {} REFUSED — {err}",
+                binding.label()
+            ));
+            Rebind::Refused(err)
+        }
+    }
+}
+
+/// The hotkey, the menu row and the page's switch are one action. The engine is the live truth; the
+/// store is written here so a hotkey toggle survives a restart exactly like the page's toggle does.
+fn toggle_mute() {
+    let Some((engine, settings)) = with(|tray| (tray.engine.clone(), tray.settings.clone())) else {
+        return;
+    };
+    let muted = engine.toggle_mic_muted();
+    if muted {
+        crate::cue::muted();
+    } else {
+        crate::cue::unmuted();
+    }
+    settings
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .set_mic_muted(muted);
+    with(|tray| {
+        tray.muted = muted;
+        if let Some(item) = tray.items.iter_mut().find(|item| item.id == ITEM_MUTE) {
+            item.label = mute_label(muted);
+        }
+    });
+    log::line(&format!(
+        "tray: microphone {}",
+        if muted { "muted" } else { "unmuted" }
+    ));
+}
+
+/// The row states the action, not the state: a toggle labelled with what it is now leaves the user
+/// guessing whether clicking changes it.
+fn mute_label(muted: bool) -> Vec<u16> {
+    wide(if muted {
+        "取消麦克风静音"
+    } else {
+        "静音麦克风"
+    })
 }
 
 fn measure_item(lparam: LPARAM) {
@@ -545,12 +751,21 @@ unsafe fn paint_row(
 }
 
 fn tick() {
-    // One snapshot per tick: the tooltip changes only on a transition, and both exits are noticed here.
+    // One snapshot per tick: the tooltip and the menu row change only on a transition, and both exits
+    // are noticed here. The page can toggle the microphone between two ticks; the engine's answer is
+    // what keeps the menu honest.
     let Some((hwnd, running, changed, stopped, expired)) = with(|tray| {
-        let running = tray.engine.snapshot().running;
+        let status = tray.engine.snapshot();
+        let running = status.running;
         let changed = tray.running != running;
         if changed {
             tray.running = running;
+        }
+        if tray.muted != status.mic_muted {
+            tray.muted = status.mic_muted;
+            if let Some(item) = tray.items.iter_mut().find(|item| item.id == ITEM_MUTE) {
+                item.label = mute_label(status.mic_muted);
+            }
         }
         let expired = tray
             .deadline

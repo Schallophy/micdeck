@@ -103,6 +103,8 @@ pub struct EngineStatus {
     pub mic_id: String,
     pub mic_name: String,
     pub mic_gain: f32,
+    /// The master switch: the microphone is captured but its slot on every line is at zero gain.
+    pub mic_muted: bool,
     pub mic_level: f32,
     pub mic_hold: f32,
     pub mic_routes: Vec<RouteInfo>,

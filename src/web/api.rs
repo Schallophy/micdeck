@@ -61,6 +61,7 @@ impl Response {
             200 => "OK",
             400 => "Error",
             404 => "Not Found",
+            409 => "Conflict",
             _ => "Error",
         }
     }
@@ -97,6 +98,28 @@ impl Default for GainRequest {
     fn default() -> Self {
         Self { id: 0, gain: 1.0 }
     }
+}
+
+/// `muted` has no default, unlike every other request field: a body that omits the switch must be
+/// refused, not read as "open the microphone".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MicMuteRequest {
+    muted: bool,
+}
+
+/// Likewise required: an empty string is the explicit "no shortcut", so a body that forgets the field
+/// must not be read as "disable the shortcut".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct HotkeyRequest {
+    hotkey: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HotkeyView {
+    hotkey: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,7 +413,52 @@ fn dispatch(
         settings.set_mic(&request.device_id, request.gain);
         return Ok(ok());
     }
+    if method == "POST" && path == "/api/mic/mute" {
+        let request: MicMuteRequest = from_json(body)?;
+        if engine.set_mic_muted(request.muted) {
+            if request.muted {
+                crate::cue::muted();
+            } else {
+                crate::cue::unmuted();
+            }
+        }
+        let mut settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        settings.set_mic_muted(request.muted);
+        return Ok(ok());
+    }
+    if method == "GET" && path == "/api/hotkey" {
+        return Ok(Response::json(&hotkey_view(settings)));
+    }
+    if method == "POST" && path == "/api/hotkey" {
+        let request: HotkeyRequest = from_json(body)?;
+        let binding = crate::hotkey::parse(&request.hotkey)?;
+        let canonical = binding.map(|binding| binding.label()).unwrap_or_default();
+        // The running window is the only thing that can register a chord. A refused chord must leave
+        // the store untouched, so persistence waits for the answer.
+        match crate::tray::rebind(binding) {
+            crate::tray::Rebind::Applied | crate::tray::Rebind::NoTray => {
+                settings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .set_hotkey(&canonical);
+                return Ok(Response::json(&HotkeyView { hotkey: canonical }));
+            }
+            crate::tray::Rebind::Refused(message) => {
+                return Ok(Response::error(409, message));
+            }
+        }
+    }
     Ok(Response::error(404, format!("not found: {method} {path}")))
+}
+
+fn hotkey_view(settings: &Arc<Mutex<Settings>>) -> HotkeyView {
+    HotkeyView {
+        hotkey: settings
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .hotkey
+            .clone(),
+    }
 }
 
 fn list_devices() -> Devices {

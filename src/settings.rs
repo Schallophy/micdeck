@@ -15,6 +15,10 @@ fn one() -> f32 {
     1.0
 }
 
+fn default_hotkey() -> String {
+    crate::hotkey::DEFAULT.to_string()
+}
+
 const GAIN_EPSILON: f32 = 0.0001;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,6 +73,12 @@ pub struct Settings {
     #[serde(default = "one")]
     pub mic_gain: f32,
     #[serde(default)]
+    pub mic_muted: bool,
+    /// The global mute shortcut in the canonical spelling; empty disables it. A file written before
+    /// this feature existed gets the chord the product has always advertised.
+    #[serde(default = "default_hotkey")]
+    pub hotkey: String,
+    #[serde(default)]
     pub lines: Vec<LineSetting>,
     #[serde(default)]
     pub mic_routes: Vec<u32>,
@@ -90,6 +100,8 @@ impl Default for Settings {
         Self {
             mic_id: String::new(),
             mic_gain: 1.0,
+            mic_muted: false,
+            hotkey: default_hotkey(),
             lines: Vec::new(),
             mic_routes: Vec::new(),
             sources: Vec::new(),
@@ -191,6 +203,22 @@ impl Settings {
         }
         self.mic_id = device_id.to_string();
         self.mic_gain = gain;
+        self.save();
+    }
+
+    pub fn set_mic_muted(&mut self, muted: bool) {
+        if self.mic_muted == muted {
+            return;
+        }
+        self.mic_muted = muted;
+        self.save();
+    }
+
+    pub fn set_hotkey(&mut self, hotkey: &str) {
+        if self.hotkey == hotkey {
+            return;
+        }
+        self.hotkey = hotkey.to_string();
         self.save();
     }
 
@@ -360,6 +388,8 @@ mod tests {
         let mut settings = Settings::load_at(&path);
         settings.store = path.clone();
         settings.set_mic("{0.0.1.00000000}.{mic}", 0.5);
+        settings.set_mic_muted(true);
+        settings.set_hotkey("Ctrl+Shift+F8");
         settings.set_lines(&[(
             1,
             "{0.0.0.00000000}.{out}",
@@ -375,11 +405,15 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"micId\""), "camelCase keys");
         assert!(text.contains("\"deviceId\""), "camelCase keys");
+        assert!(text.contains("\"micMuted\": true"), "the switch is a stored fact");
+        assert!(text.contains("\"hotkey\": \"Ctrl+Shift+F8\""), "{text}");
         assert!(text.contains("\"客厅那对音箱\""), "labels are UTF-8");
         assert!(!text.contains("lineRoutes"), "the legacy field is dropped on write");
 
         let reloaded = Settings::load_at(&path);
         assert_eq!(reloaded.mic_id, "{0.0.1.00000000}.{mic}");
+        assert!(reloaded.mic_muted, "a muted microphone stays muted");
+        assert_eq!(reloaded.hotkey, "Ctrl+Shift+F8");
         assert_eq!(reloaded.lines.len(), 1);
         assert_eq!(reloaded.lines[0].label, "客厅那对音箱");
         assert_eq!(reloaded.mic_routes, vec![1]);
@@ -428,6 +462,8 @@ mod tests {
             path: String::new(),
         };
         settings.set_mic("{mic}", 1.0);
+        settings.set_mic_muted(true);
+        settings.set_hotkey("Ctrl+Shift+F8");
         settings.set_lines(&[(1, "{out}", "备注")]);
         settings.set_mic_routes(&[1]);
         settings.set_sources(&[(identity.clone(), "", 1.0, &[1])]);
@@ -436,6 +472,8 @@ mod tests {
         // The same values again: every setter compares first, so a redragged slider or a re-sent
         // topology must not touch the disk.
         settings.set_mic("{mic}", 1.0);
+        settings.set_mic_muted(true);
+        settings.set_hotkey("Ctrl+Shift+F8");
         settings.set_lines(&[(1, "{out}", "备注")]);
         settings.set_mic_routes(&[1]);
         settings.set_sources(&[(identity.clone(), "", 1.0, &[1])]);
@@ -485,6 +523,11 @@ mod tests {
         assert!(settings.sources.is_empty());
         assert_eq!(settings.mic_gain, 1.0, "a defaulted gain is 1.0, not 0");
         assert_eq!(
+            settings.hotkey,
+            crate::hotkey::DEFAULT,
+            "an old store gets the shortcut the product advertises"
+        );
+        assert_eq!(
             settings.store, path,
             "an unreadable store still knows where it is"
         );
@@ -494,6 +537,7 @@ mod tests {
         let settings = Settings::load_at(&path);
         assert_eq!(settings.mic_id, "{mic}");
         assert_eq!(settings.mic_gain, 1.0);
+        assert!(!settings.mic_muted, "an absent switch is an open microphone");
         let _ = std::fs::remove_file(&path);
     }
 
