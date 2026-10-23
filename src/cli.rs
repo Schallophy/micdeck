@@ -27,17 +27,8 @@ pub enum Command {
         mic_device: Option<String>,
         seconds: f64,
     },
-    /// Runs the real application: engine, restored settings, web UI. `limit` is `--seconds` when the
-    /// caller gave it, which is how an automated run stops itself; none means run until killed.
-    /// `tray` adds the notification-icon entry, which is what owns the process lifetime.
-    Web {
-        port: u16,
-        settings: Option<String>,
-        limit: Option<f64>,
-        tray: bool,
-    },
-    /// Reads one process's icon, or the application's own mark with `--icon brand`, as the bytes the UI
-    /// would receive — for checking the encoder against a decoder.
+    /// Reads one process's icon, or the application's own mark with `--icon brand`, as the bytes the
+    /// page would receive — for checking the encoder against a decoder.
     DumpIcon {
         target: String,
         out: String,
@@ -65,42 +56,24 @@ const USAGE_LINES: &[&str] = &[
     "  --capture-loopback [--device s] whole render endpoint (control path)",
     "  --engine --line <id|name>      run the real engine on one line: optional --pid source, --mic-device",
     "                                 --line may be repeated to run two lines at once",
-    "  --web [--port n]              run the product: engine, restored settings, UI on 127.0.0.1",
-    "                                 no page is opened at startup: double-click the tray icon, or",
-    "                                 paste the url the run logs",
-    "  --tray                           add the notification-icon entry; implies --web, and is what",
-    "                                   running the program with no arguments at all means",
-    "                                   with --seconds n the run stops itself after n seconds",
-    "                                   --settings <file> reads and writes that file instead of %APPDATA%",
-    "  --icon <pid|brand> [--out f.ico]  write that process's icon, or our own mark, as /api/icon serves it",
+    "  --icon <pid|brand> [--out f.ico]  write that process's icon, or our own mark, as the page receives it",
     "  --render-tone [--device s]     event-driven shared render, optional loopback of the same endpoint",
     "",
     "  --seconds <n>  --out <file.wav>  --low-latency  --buffer-ms <n>  --hz <f>  --level <f>",
     "  --exclude      with --capture-pid, capture everything except the target tree",
     "  --log <file>   also write the log to a file",
+    "",
+    "  The product itself is micdeck-desktop: engine, window and tray in one binary.",
 ];
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
-    // No arguments is how the product is started: web UI, tray entry, stay up. The page waits for the
-    // user: the tray's double-click (or the logged url).
-    if args.is_empty() {
-        return Ok(Command::Web {
-            port: 8765,
-            settings: None,
-            limit: None,
-            tray: true,
-        });
-    }
+    // Nothing at all is a diagnostic run with no mode, not a product launch: the product is
+    // micdeck-desktop, and double-clicking this binary prints the usage.
     let mut pid: Option<u32> = None;
     let mut mic = false;
     let mut loopback = false;
     let mut render = false;
     let mut engine = false;
-    let mut web = false;
-    let mut tray = false;
-    let mut port: u16 = 8765;
-    let mut settings_path: Option<String> = None;
-    let mut seconds_given = false;
     let mut icon_target: Option<String> = None;
     let mut line_selectors: Vec<String> = Vec::new();
     let mut mic_device: Option<String> = None;
@@ -136,24 +109,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             "--capture-loopback" => loopback = true,
             "--render-tone" => render = true,
             "--engine" => engine = true,
-            "--web" => web = true,
-            // The tray owns the process lifetime, so asking for it means asking for the server too.
-            "--tray" => {
-                tray = true;
-                web = true;
-            }
             "--icon" => {
                 let target = next(a)?;
                 if target != "brand" && target.parse::<u32>().is_err() {
                     return Err(format!("--icon takes a pid or the word brand, got {target}"));
                 }
                 icon_target = Some(target);
-            }
-            "--settings" => settings_path = Some(next(a)?),
-            "--port" => {
-                port = next(a)?
-                    .parse::<u16>()
-                    .map_err(|e| format!("bad --port: {e}"))?
             }
             "--line" => line_selectors.push(next(a)?),
             "--mic-device" => mic_device = Some(next(a)?),
@@ -166,7 +127,6 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 seconds = next(a)?
                     .parse::<f64>()
                     .map_err(|e| format!("bad --seconds: {e}"))?;
-                seconds_given = true;
             }
             "--hz" => hz = next(a)?.parse::<f64>().map_err(|e| format!("bad --hz: {e}"))?,
             "--level" => {
@@ -195,13 +155,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
         loopback,
         render,
         engine,
-        web,
         icon_target.is_some(),
     ];
     let modes = chosen.iter().filter(|on| **on).count();
     if modes + [list, sessions].iter().filter(|on| **on).count() != 1 {
         return Err(
-            "exactly one of --list-devices, --list-audio-sessions, --capture-pid, --capture-mic, --capture-loopback, --render-tone, --engine, --web, --icon is required"
+            "exactly one of --list-devices, --list-audio-sessions, --capture-pid, --capture-mic, --capture-loopback, --render-tone, --engine, --icon is required"
                 .to_string(),
         );
     }
@@ -221,14 +180,6 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             pid,
             mic_device,
             seconds,
-        });
-    }
-    if web {
-        return Ok(Command::Web {
-            port,
-            settings: settings_path,
-            limit: if seconds_given { Some(seconds) } else { None },
-            tray,
         });
     }
     if capture_mode || mic || loopback {
@@ -287,62 +238,25 @@ mod tests {
         super::parse(&text.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
-    /// Starting the program with nothing is how a double-click arrives, and it means the product: server
-    /// plus tray, no self-imposed deadline. The page is not launched; the tray owns that entry.
+    /// The product is `micdeck-desktop` now. This binary with no arguments is a diagnostic run that
+    /// asked for nothing, which is an error and not a silent launch of something else.
     #[test]
-    fn no_arguments_means_the_product_with_a_tray_entry() {
-        let command = parse(&[]).expect("no arguments must be a valid run");
-        match command {
-            Command::Web {
-                port,
-                settings,
-                limit,
-                tray,
-            } => {
-                assert_eq!(port, 8765);
-                assert!(tray);
-                assert!(settings.is_none());
-                assert_eq!(limit, None);
-            }
-            other => panic!("expected a web run, got {other:?}"),
-        }
+    fn no_arguments_is_not_a_mode() {
+        assert!(parse(&[]).is_err());
     }
 
     #[test]
-    fn asking_for_the_tray_asks_for_the_server_too() {
-        match parse(&["--tray"]).unwrap() {
-            Command::Web { tray, .. } => assert!(tray),
-            other => panic!("expected a web run, got {other:?}"),
-        }
-        // The port may be moved, and a smoke run may bound itself.
-        match parse(&["--tray", "--port", "9001", "--seconds", "7"]).unwrap() {
-            Command::Web {
-                port, limit, tray, ..
-            } => {
-                assert_eq!(port, 9001);
-                assert_eq!(limit, Some(7.0));
-                assert!(tray);
-            }
-            other => panic!("expected a web run, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn the_removed_browser_flag_is_refused() {
-        // Nothing opens the page at startup any more, so the flag would be a lie if it were accepted.
-        assert!(parse(&["--tray", "--no-browser"]).is_err());
-    }
-
-    /// `--web` without `--seconds` runs until the tray or Ctrl+C ends it; a `--seconds` that was not
-    /// passed must not silently bound a product run at the default ten.
-    #[test]
-    fn only_an_explicit_seconds_bounds_a_web_run() {
-        match parse(&["--web"]).unwrap() {
-            Command::Web { limit, tray, .. } => {
-                assert_eq!(limit, None);
-                assert!(!tray, "--web alone is the server without an icon");
-            }
-            other => panic!("expected a web run, got {other:?}"),
+    fn the_flags_that_moved_to_the_desktop_shell_are_refused() {
+        // The server, the port, the tray entry and the browser switch all belonged to the web UI; a run
+        // that still passes them must be told, not quietly ignored.
+        for flags in [
+            vec!["--web"],
+            vec!["--tray"],
+            vec!["--port", "9001"],
+            vec!["--no-browser"],
+            vec!["--settings", "C:\\tmp\\x.json"],
+        ] {
+            assert!(parse(&flags).is_err(), "{flags:?} must be refused");
         }
     }
 
@@ -364,18 +278,17 @@ mod tests {
             other => panic!("expected an icon dump, got {other:?}"),
         }
         assert!(parse(&["--icon", "CABLE"]).is_err());
-        assert!(parse(&["--icon", "4321", "--web"]).is_err());
+        assert!(parse(&["--icon", "4321", "--engine", "--line", "x"]).is_err());
         assert!(parse(&["--icon", "-3"]).is_err());
     }
 
     #[test]
     fn one_mode_per_run_and_no_silent_default() {
-        assert!(parse(&["--web", "--list-devices"]).is_err());
+        assert!(parse(&["--engine", "--line", "x", "--list-devices"]).is_err());
         assert!(parse(&["--capture-mic", "--capture-loopback"]).is_err());
-        assert!(parse(&["--tray", "--seconds", "0"]).is_err());
+        assert!(parse(&["--engine", "--line", "x", "--seconds", "0"]).is_err());
         assert!(parse(&["--nonsense"]).is_err());
-        // Nothing at all is the product, not an error — so the usage text must not be what a
-        // double-click prints.
-        assert!(parse(&[]).is_ok());
+        // `--engine` without a line is a mode with nothing to run on.
+        assert!(parse(&["--engine"]).is_err());
     }
 }

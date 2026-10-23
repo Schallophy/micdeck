@@ -7,7 +7,6 @@
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -43,7 +42,6 @@ use crate::platform::brand;
 use crate::popup;
 use crate::settings::Settings;
 use crate::tap;
-use crate::web;
 
 /// The callback message the shell posts when the icon is touched.
 const ICON_MESSAGE: u32 = WM_APP + 1;
@@ -78,9 +76,8 @@ struct Tray {
     hwnd: isize,
     engine: Arc<Engine>,
     settings: Arc<Mutex<Settings>>,
-    url: String,
-    /// The accept loop's own "I stopped" flag: when it goes, the product has nothing left to serve.
-    stopped: Arc<AtomicBool>,
+    /// Shows the window. The shell owns it, so the tray only knows how to ask.
+    on_open: Arc<dyn Fn() + Send + Sync>,
     /// Set only by a bounded smoke run; the tick treats it as a shutdown request.
     deadline: Option<Instant>,
     icon: isize,
@@ -125,13 +122,13 @@ fn hwnd_of(value: isize) -> HWND {
     HWND(value as *mut c_void)
 }
 
-/// Runs the tray until its menu says quit, the web server stops, or `limit_seconds` elapses.
+/// Runs the tray until its menu says quit or `limit_seconds` elapses. `on_open` is what the "打开
+/// MicDeck" row and the double-click do; the shell that owns the window supplies it.
 pub fn run(
     engine: Arc<Engine>,
     settings: Arc<Mutex<Settings>>,
-    url: &str,
-    stopped: Arc<AtomicBool>,
     limit_seconds: Option<f64>,
+    on_open: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
     // Before any window is created or any metric is read, or the menu font and the icon size come back
     // for the wrong display. It fails harmlessly when a manifest already decided this.
@@ -208,7 +205,7 @@ pub fn run(
     let dark = is_dark_theme();
 
     let mut notify = notify_for(hwnd, icon, NIF_ICON | NIF_MESSAGE | NIF_TIP);
-    write_tip(&mut notify, running, url);
+    write_tip(&mut notify, running);
     if unsafe { Shell_NotifyIconW(NIM_ADD, &notify) } == FALSE {
         unsafe {
             let _ = DestroyIcon(icon);
@@ -267,8 +264,7 @@ pub fn run(
         hwnd: hwnd.0 as isize,
         engine,
         settings,
-        url: url.to_string(),
-        stopped,
+        on_open: Arc::new(on_open),
         deadline,
         icon: icon.0 as isize,
         items,
@@ -416,10 +412,9 @@ fn note_unknown_event(event: u32, wparam: WPARAM, lparam: LPARAM) {
     }
 }
 
+/// The "打开 MicDeck" row and the double-click. The shell owns the window, so this hands off.
 fn open_page() {
-    if let Some(url) = with(|tray| tray.url.clone()) {
-        web::open_page(&url);
-    }
+    with(|tray| (tray.on_open)());
 }
 
 fn show_menu(owner: HWND) {
@@ -648,7 +643,7 @@ fn tick() {
     // One snapshot per tick: the tooltip and the menu row change only on a transition, and both exits
     // are noticed here. The page can toggle the microphone between two ticks; the engine's answer is
     // what keeps the menu honest.
-    let Some((hwnd, running, changed, stopped, expired)) = with(|tray| {
+    let Some((hwnd, running, changed, expired)) = with(|tray| {
         let status = tray.engine.snapshot();
         let running = status.running;
         let changed = tray.running != running;
@@ -664,20 +659,14 @@ fn tick() {
         let expired = tray
             .deadline
             .is_some_and(|deadline| Instant::now() >= deadline);
-        (
-            tray.hwnd,
-            running,
-            changed,
-            tray.stopped.load(Ordering::Relaxed),
-            expired,
-        )
+        (tray.hwnd, running, changed, expired)
     }) else {
         return;
     };
     if changed {
         update_tip(running);
     }
-    if stopped || expired {
+    if expired {
         unsafe {
             let _ = DestroyWindow(hwnd_of(hwnd));
         }
@@ -687,17 +676,16 @@ fn tick() {
 fn update_tip(running: bool) {
     with(|tray| {
         tray.running = running;
-        let url = tray.url.clone();
         let mut notify = notify_for(
             hwnd_of(tray.hwnd),
             HICON(tray.icon as *mut c_void),
             NIF_ICON | NIF_TIP,
         );
-        write_tip(&mut notify, running, &url);
+        write_tip(&mut notify, running);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &notify);
         }
-        log::line(&format!("tray: {}", one_line(&tooltip(running, &url))));
+        log::line(&format!("tray: {}", tooltip(running)));
     });
 }
 
@@ -757,22 +745,19 @@ fn is_dark_theme() -> bool {
     error.0 == 0 && value == 0
 }
 
-/// Word-for-word what `BuildTooltip` produced, line break included.
-fn tooltip(running: bool, url: &str) -> String {
+/// The one line the shell shows over the icon. It used to carry the page's url on a second line; the
+/// window has an address now, so the state alone is what is worth saying.
+fn tooltip(running: bool) -> String {
     if running {
-        format!("MicDeck — 混音运行中\n{url}")
+        "MicDeck — 混音运行中".to_string()
     } else {
-        format!("MicDeck — 已停止\n{url}")
+        "MicDeck — 已停止".to_string()
     }
 }
 
-fn one_line(text: &str) -> String {
-    text.replace('\n', " / ")
-}
-
-/// `szTip` holds 128 characters with its terminator; a long url is cut, not dropped.
-fn write_tip(notify: &mut NOTIFYICONDATAW, running: bool, url: &str) {
-    let text = wide(&tooltip(running, url));
+/// `szTip` holds 128 characters with its terminator; a long text is cut, not dropped.
+fn write_tip(notify: &mut NOTIFYICONDATAW, running: bool) {
+    let text = wide(&tooltip(running));
     let used = text.len().min(notify.szTip.len() - 1);
     notify.szTip[..used].copy_from_slice(&text[..used]);
     for slot in &mut notify.szTip[used..] {
@@ -789,41 +774,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tooltip_says_what_the_csharp_tray_said() {
-        assert_eq!(
-            tooltip(true, "http://127.0.0.1:8765/"),
-            "MicDeck — 混音运行中\nhttp://127.0.0.1:8765/"
-        );
-        assert_eq!(tooltip(false, "http://x/"), "MicDeck — 已停止\nhttp://x/");
-        assert_eq!(
-            one_line(&tooltip(true, "http://x/")),
-            "MicDeck — 混音运行中 / http://x/"
-        );
+    fn the_tooltip_says_the_state_and_nothing_else() {
+        assert_eq!(tooltip(true), "MicDeck — 混音运行中");
+        assert_eq!(tooltip(false), "MicDeck — 已停止");
     }
 
-    /// The shell's tip buffer is 128 characters wide. A long url is cut, never overrun, and always
-    /// terminated.
+    /// `szTip` holds 128 characters with its terminator. The text is a constant now, so what this
+    /// guards is that it is written terminated and never reaches the last slot.
     #[test]
-    fn a_long_tooltip_is_cut_at_the_buffer_rather_than_past_it() {
-        let mut notify = NOTIFYICONDATAW::default();
-        let url = "http://127.0.0.1:8765/".repeat(20);
-        write_tip(&mut notify, true, &url);
-        let text = String::from_utf16(&notify.szTip).unwrap();
-        let text = text.trim_end_matches('\0');
-        assert_eq!(text.chars().count(), 127);
-        assert!(text.starts_with("MicDeck — 混音运行中\nhttp://127.0.0.1"));
-        assert_eq!(notify.szTip[127], 0);
-    }
-
-    #[test]
-    fn a_short_tooltip_keeps_its_line_break() {
-        let mut notify = NOTIFYICONDATAW::default();
-        write_tip(&mut notify, false, "http://127.0.0.1:8765/");
-        let text = String::from_utf16(&notify.szTip)
-            .unwrap()
-            .trim_end_matches('\0')
-            .to_string();
-        assert_eq!(text, tooltip(false, "http://127.0.0.1:8765/"));
+    fn the_tooltip_is_written_inside_the_shell_buffer() {
+        for running in [true, false] {
+            let mut notify = NOTIFYICONDATAW::default();
+            write_tip(&mut notify, running);
+            let text = String::from_utf16(&notify.szTip)
+                .unwrap()
+                .trim_end_matches('\0')
+                .to_string();
+            assert_eq!(text, tooltip(running));
+            assert!(text.chars().count() < 127, "room to spare: {text}");
+            assert_eq!(notify.szTip[text.encode_utf16().count()], 0);
+        }
     }
 
     #[test]

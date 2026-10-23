@@ -4,7 +4,6 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::app;
 use crate::cli::Command;
 use crate::engine::status::{EngineStatus, LineInfo, RouteInfo};
 use crate::engine::{Engine, SystemClock};
@@ -15,8 +14,6 @@ use crate::util::wav::WavWriter;
 const EXIT_OK: i32 = 0;
 const EXIT_BAD_ARGS: i32 = 1;
 const EXIT_DEVICE_OR_PID: i32 = 3;
-/// The tray could not be set up: the product is running nowhere.
-const EXIT_TRAY: i32 = 5;
 
 pub fn entry() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -55,12 +52,6 @@ fn run(command: Command) -> i32 {
             mic_device,
             seconds,
         } => engine_smoke(&lines, pid, mic_device.as_deref(), seconds),
-        Command::Web {
-            port,
-            settings,
-            limit,
-            tray,
-        } => web_server(port, settings.as_deref(), limit, tray),
         Command::DumpIcon { target, out } => dump_icon(&target, &out),
         Command::CapturePid {
             pid,
@@ -571,65 +562,6 @@ fn quantize(sorted: &[f64]) -> String {
         index += run;
     }
     out
-}
-
-/// Serves the product: the engine with the restored topology, and the local UI. Without `--seconds` this
-/// is the long-lived form; the tray in R4 is what normally owns that lifetime.
-fn web_server(port: u16, settings: Option<&str>, limit: Option<f64>, tray: bool) -> i32 {
-    // A tray run can have no console, so without `--log` the record goes to a temp file.
-    if tray && !crate::log::path_is_set() {
-        let path = std::env::temp_dir().join("MicDeck-web.log");
-        crate::log::init(&path.to_string_lossy());
-    }
-    let app = match app::start(port, settings) {
-        Ok(app) => app,
-        Err(err) => {
-            line(&format!("web ui could not start: {err}"));
-            return EXIT_DEVICE_OR_PID;
-        }
-    };
-    line(&format!("serving {}", app.url()));
-    let mut code = EXIT_OK;
-    if tray {
-        #[cfg(windows)]
-        {
-            if let Err(err) = crate::tray::run(
-                app.engine.clone(),
-                app.settings(),
-                app.url(),
-                app.web_stopped(),
-                limit,
-            ) {
-                line(&format!("tray failed: {err}"));
-                code = EXIT_TRAY;
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            line("a tray entry is windows-only; waiting instead");
-            wait_for_limit(limit);
-        }
-    } else {
-        wait_for_limit(limit);
-    }
-    app.stop();
-    if code != EXIT_OK {
-        line(&format!("RESULT=FAIL code={code} stage=tray"));
-        return code;
-    }
-    line("RESULT=OK");
-    EXIT_OK
-}
-
-/// Runs until `--seconds` says otherwise, or forever when it did not. Without a tray this is the only
-/// thing keeping the process up; with one, the tick does it instead.
-fn wait_for_limit(limit: Option<f64>) {
-    match limit {
-        Some(seconds) => std::thread::sleep(Duration::from_secs_f64(seconds)),
-        None => loop {
-            std::thread::sleep(Duration::from_secs(1));
-        },
-    }
 }
 
 /// Runs the real engine against one output line, with an optional process source and microphone, and

@@ -1,3 +1,4 @@
+pub mod api;
 pub mod app;
 pub mod bench;
 pub mod cli;
@@ -14,4 +15,3 @@ pub mod tap;
 #[cfg(windows)]
 pub mod tray;
 pub mod util;
-pub mod web;

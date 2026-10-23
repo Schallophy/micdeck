@@ -1,0 +1,6 @@
+{
+  "$schema": "https://schema.tauri.app/capabilities/2",
+  "identifier": "default",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

@@ -1,38 +1,27 @@
-//! The application bootstrap: engine, settings, restore, web server. Separate from `main` because the
-//! tray owns the same startup path.
+//! The application bootstrap: engine, settings and the restore that puts a saved topology back.
+//! Separate from `main` because the tray and the desktop shell own the same startup path.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use crate::api;
 use crate::engine::status::Identity;
 use crate::engine::{Engine, SystemClock};
 use crate::log;
 use crate::settings::Settings;
-use crate::web::{self, WebUi};
 
 pub struct App {
     pub engine: Arc<Engine>,
     pub settings: Arc<Mutex<Settings>>,
-    web: WebUi,
 }
 
 impl App {
-    pub fn url(&self) -> &str {
-        self.web.url()
-    }
-
-    /// The signal the tray watches: the accept loop has ended, so nothing is being served any more.
-    pub fn web_stopped(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.web.stopped_signal()
-    }
-
     /// The tray's hotkey writes the switch back to the store; it owns no settings of its own.
     pub fn settings(&self) -> Arc<Mutex<Settings>> {
         self.settings.clone()
     }
 
     pub fn stop(&self) {
-        self.web.stop();
         self.engine.stop();
     }
 }
@@ -40,7 +29,7 @@ impl App {
 /// `store` overrides the settings file. A test instance must not restore the live topology: that file
 /// names the user's output line and their microphone, and opening the microphone is what puts the room
 /// on the wire.
-pub fn start(port: u16, store: Option<&str>) -> Result<App, String> {
+pub fn start(store: Option<&str>) -> Result<App, String> {
     let engine = Engine::start(Arc::new(SystemClock));
     let mut store = match store {
         Some(path) => Settings::load_at(std::path::Path::new(path)),
@@ -58,12 +47,7 @@ pub fn start(port: u16, store: Option<&str>) -> Result<App, String> {
     ));
     let settings = Arc::new(Mutex::new(store));
     restore(&engine, &settings);
-    let web = web::start(engine.clone(), settings.clone(), port)?;
-    Ok(App {
-        engine,
-        settings,
-        web,
-    })
+    Ok(App { engine, settings })
 }
 
 /// Restore order is lines, then sources, then microphone routes, then the microphone; every stored line
@@ -131,5 +115,5 @@ fn restore(engine: &Arc<Engine>, settings: &Arc<Mutex<Settings>>) {
     }
 
     // The live ids are the truth now; write them back so the next launch translates nothing.
-    web::api::persist_topology(engine, settings);
+    api::persist_topology(engine, settings);
 }

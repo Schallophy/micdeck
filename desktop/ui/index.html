@@ -257,10 +257,36 @@ const state = {
   picker:[], pickerSig:'', pickerTimer:null,
   restarting:false, connected:true, lastEventAt:0, busy:false, hotkey:'',
   sig:'', lineSig:'', rows:new Map(), lineEls:new Map(), gainTimers:{}, gainDrafts:{}, micGainDraft:null, labelTimers:{}, labelDrafts:{}, lastBanners:''};
-async function getJson(url){ const r = await fetch(url); return r.json(); }
+// The page speaks the route table verbatim; only the wire changed. `api_request` answers with exactly
+// the JSON body the local server used to write, so a refused edit arrives as {error} rather than as a
+// rejected promise.
+const tauri = window.__TAURI__;
+const invoke = (cmd, args) => tauri.core.invoke(cmd, args);
+async function getJson(url){ return invoke('api_request', { method:'GET', path:url, body:'' }); }
 async function post(url, body){
-  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})});
-  try { return await r.json(); } catch { return {}; }
+  try {
+    return await invoke('api_request', { method:'POST', path:url, body: JSON.stringify(body||{}) });
+  } catch (e) { return {}; }
+}
+// Icons come over the same channel as everything else, so the browser's image cache has to be replaced
+// by this map: one fetch per pid, an object url for the img to hold, and a blank gif until it lands —
+// the grey square is the element's own background, which is what the 1×1 png used to keep.
+const BLANK = 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+const iconUrls = new Map();
+const iconAsking = new Set();
+function iconSrc(pid){
+  if (!pid) return BLANK;
+  const cached = iconUrls.get(pid);
+  if (cached) return cached;
+  if (!iconAsking.has(pid)) {
+    iconAsking.add(pid);
+    invoke('icon', { pid }).then(icon => {
+      const url = URL.createObjectURL(new Blob([new Uint8Array(icon.bytes)], { type: icon.mime }));
+      iconUrls.set(pid, url);
+      document.querySelectorAll(`img[data-pid="${pid}"]`).forEach(img => { img.src = url; });
+    }).catch(() => {}).finally(() => iconAsking.delete(pid));
+  }
+  return BLANK;
 }
 const pct = v => {
   if (!v || v <= 0.000001) return 0;
@@ -424,7 +450,7 @@ function renderPicker(){
       box.innerHTML = rows.map(r => {
         const added = state.sources.some(s => s.pid === r.pid && sourceAlive(s));
         return `<div class="prow" data-pid="${r.pid}">
-          <img class="picon" src="/api/icon?pid=${r.pid}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+          <img class="picon" data-pid="${r.pid}" src="${iconSrc(r.pid)}" alt="">
           <div class="pmain"><div class="ptitle">${escapeHtml(r.title || r.name)}</div>` +
           `<div class="pname">${escapeHtml(r.name)}</div></div>
           <div class="meter"><div class="fill pick"></div><span class="hold"></span></div>
@@ -502,7 +528,7 @@ function renderDeviceLists(){
 function rowHtml(s){
   const alive = sourceAlive(s);
   const label = sourceLabel(s);
-  return `<img class="picon" src="/api/icon?pid=${s.pid}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
+  return `<img class="picon" data-pid="${s.pid}" src="${iconSrc(s.pid)}" alt="">
     <div class="amain">
       <div class="atitle" draggable="${alive}" data-src="${s.id}" title="${escapeHtml(label)}">${escapeHtml(label)}<span class="tag" ${alive ? 'hidden' : ''}>待接入</span></div>
       <div class="meter"><div class="fill app"></div><span class="hold"></span></div>
@@ -589,7 +615,7 @@ function updateRows(){
 
 // --- line pools --------------------------------------------------------------------------------
 function chipHtml(lineId, s){
-  return `<span class="chip"><img src="/api/icon?pid=${s.pid}" alt="" onerror="this.style.visibility='hidden'">` +
+  return `<span class="chip"><img data-pid="${s.pid}" src="${iconSrc(s.pid)}" alt="">` +
     `<span class="cname">${escapeHtml(sourceLabel(s))}</span>` +
     `<button class="cx" data-src="${s.id}" data-line="${lineId}" title="断开连接">×</button></span>`;
 }
@@ -849,67 +875,49 @@ function setState(s){
   if (state.lastBanners !== bannerHtml) { state.lastBanners = bannerHtml; $('banners').innerHTML = bannerHtml; }
 }
 
-// No log panel anymore: this poll is the backend heartbeat, and it tells a fresh instance that a
-// tab from the previous run is still open (WebUi._sawUiClient). It also carries the build id of the
-// UI the backend is serving: after a rebuild and restart the tab reloads itself instead of silently
-// running stale JavaScript against a newer engine.
-let pageBuild = '';
-async function ping(){
-  try {
-    const r = await getJson('/api/ping');
-    if (!pageBuild) pageBuild = r.build || '';
-    else if (r.build && r.build !== pageBuild) { location.reload(); return; }
-  } catch (e) { setConnected(false); }
-}
-
-let events = null;
+// The window is the app: there is no stale tab to detect and no build id to compare against, so the
+// heartbeat that used to carry both is gone. What is left to watch is whether the push loop delivers.
+let unlisten = null;
+let listening = false;
 function initEvents(){
-  try {
+  state.lastEventAt = Date.now();
+  listening = true;
+  tauri.event.listen('state', ev => {
     state.lastEventAt = Date.now();
-    events = new EventSource('/api/events');
-    events.onopen = () => setConnected(true);
-    events.onerror = () => { if (events) setConnected(false); };
-    events.onmessage = ev => {
-      state.lastEventAt = Date.now();
-      try { setState(JSON.parse(ev.data)); } catch (e) {}
-      setConnected(true);
-    };
-  } catch (e) { events = null; setConnected(false); }
+    try { setState(ev.payload); } catch (e) {}
+    setConnected(true);
+  }).then(fn => { unlisten = fn; }).catch(() => { listening = false; setConnected(false); });
 }
 
-// A frozen backend keeps the SSE socket open but stops pushing; 33 Hz means a 3 s hole is real.
+// A frozen engine keeps the window open but stops pushing; 33 Hz means a 3 s hole is real.
 function checkLink(){
-  if (!events || !state.connected || !state.lastEventAt) return;
+  if (!listening || !state.connected || !state.lastEventAt) return;
   if (Date.now() - state.lastEventAt > 3000) setConnected(false);
 }
 
-// Nothing is shown while the tab is hidden, so nothing is worth computing: closing the EventSource
-// also stops the server's push loop, and clearing the timers stops every poll.
+// Nothing is shown while the window is hidden, so nothing is worth computing: unsubscribing stops the
+// push loop on the Rust side too, which only emits while the window is on screen.
 let uiTimers = [];
 function startUiLoops(){
   if (uiTimers.length) return;
-  if (!events) initEvents();
-  ping();
-  uiTimers.push(setInterval(ping, 1000));
-  uiTimers.push(setInterval(() => { if (!events) refreshState(); checkLink(); }, 1000));
+  if (!listening) initEvents();
+  uiTimers.push(setInterval(() => { if (!listening) refreshState(); checkLink(); }, 1000));
   uiTimers.push(setInterval(loadDevices, 15000));
 }
 function stopUiLoops(){
   uiTimers.forEach(clearInterval);
   uiTimers = [];
-  if (events) { events.close(); events = null; }
+  if (unlisten) { unlisten(); unlisten = null; }
+  listening = false;
 }
 document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
-    // A hidden tab cannot see the add list, and leaving it open would keep a capture per app alive.
+    // A hidden window cannot see the add list, and leaving it open would keep a capture per app alive.
     if ($('sourcePicker').open) closeSourcePicker();
     stopUiLoops();
     return;
   }
   startUiLoops();
-  // A hidden tab's timers are throttled by the browser, so ask for the build id right away: this is
-  // the moment the user can see the page again.
-  ping();
   refreshState();
 });
 
