@@ -40,7 +40,7 @@ impl App {
 /// `store` overrides the settings file. A test instance must not restore the live topology: that file
 /// names the user's output line and their microphone, and opening the microphone is what puts the room
 /// on the wire.
-pub fn start(port: u16, open_browser: bool, store: Option<&str>) -> Result<App, String> {
+pub fn start(port: u16, store: Option<&str>) -> Result<App, String> {
     let engine = Engine::start(Arc::new(SystemClock));
     let mut store = match store {
         Some(path) => Settings::load_at(std::path::Path::new(path)),
@@ -58,7 +58,7 @@ pub fn start(port: u16, open_browser: bool, store: Option<&str>) -> Result<App, 
     ));
     let settings = Arc::new(Mutex::new(store));
     restore(&engine, &settings);
-    let web = web::start(engine.clone(), settings.clone(), port, open_browser)?;
+    let web = web::start(engine.clone(), settings.clone(), port)?;
     Ok(App {
         engine,
         settings,

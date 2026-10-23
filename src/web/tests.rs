@@ -295,13 +295,7 @@ fn exchange(
         let stop = stop.clone();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().unwrap();
-            handle(
-                stream,
-                &engine,
-                &settings,
-                &stop,
-                &Arc::new(AtomicBool::new(false)),
-            )
+            handle(stream, &engine, &settings, &stop)
         })
     };
     let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();

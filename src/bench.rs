@@ -57,11 +57,10 @@ fn run(command: Command) -> i32 {
         } => engine_smoke(&lines, pid, mic_device.as_deref(), seconds),
         Command::Web {
             port,
-            browser,
             settings,
             limit,
             tray,
-        } => web_server(port, browser, settings.as_deref(), limit, tray),
+        } => web_server(port, settings.as_deref(), limit, tray),
         Command::DumpIcon { target, out } => dump_icon(&target, &out),
         Command::CapturePid {
             pid,
@@ -576,19 +575,13 @@ fn quantize(sorted: &[f64]) -> String {
 
 /// Serves the product: the engine with the restored topology, and the local UI. Without `--seconds` this
 /// is the long-lived form; the tray in R4 is what normally owns that lifetime.
-fn web_server(
-    port: u16,
-    browser: bool,
-    settings: Option<&str>,
-    limit: Option<f64>,
-    tray: bool,
-) -> i32 {
+fn web_server(port: u16, settings: Option<&str>, limit: Option<f64>, tray: bool) -> i32 {
     // A tray run can have no console, so without `--log` the record goes to a temp file.
     if tray && !crate::log::path_is_set() {
         let path = std::env::temp_dir().join("MicDeck-web.log");
         crate::log::init(&path.to_string_lossy());
     }
-    let app = match app::start(port, browser, settings) {
+    let app = match app::start(port, settings) {
         Ok(app) => app,
         Err(err) => {
             line(&format!("web ui could not start: {err}"));

@@ -52,7 +52,6 @@ pub fn start(
     engine: Arc<Engine>,
     settings: Arc<Mutex<Settings>>,
     port: u16,
-    open_browser: bool,
 ) -> Result<WebUi, String> {
     let mut bound: Option<TcpListener> = None;
     let mut used = port;
@@ -77,10 +76,6 @@ pub fn start(
     let stopped = Arc::new(AtomicBool::new(false));
     let server_stop = stop.clone();
     let loop_stopped = stopped.clone();
-    let saw_client = Arc::new(AtomicBool::new(false));
-    if open_browser {
-        crate::web::open_browser_when_unclaimed(&url, saw_client.clone(), server_stop.clone());
-    }
 
     std::thread::spawn(move || {
         let mut parked = false;
@@ -91,9 +86,8 @@ pub fn start(
                     let engine = engine.clone();
                     let settings = settings.clone();
                     let stop = server_stop.clone();
-                    let saw_client = saw_client.clone();
                     std::thread::spawn(move || {
-                        handle(stream, &engine, &settings, &stop, &saw_client);
+                        handle(stream, &engine, &settings, &stop);
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -189,22 +183,12 @@ fn handle(
     engine: &Arc<Engine>,
     settings: &Arc<Mutex<Settings>>,
     stop: &Arc<AtomicBool>,
-    saw_client: &Arc<AtomicBool>,
 ) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
     let request = match read_request(&mut stream) {
         Some(request) => request,
         None => return,
     };
-    // Only the page asks for these three; `/api/state` is left out so a script or a probe cannot make
-    // the server think a tab is already open.
-    if request.method == "GET"
-        && (request.target == "/"
-            || request.target.starts_with("/api/events")
-            || request.target == "/api/ping")
-    {
-        let _ = saw_client.store(true, Ordering::Relaxed);
-    }
     if request.method == "GET" && request.target.starts_with("/api/events") {
         if let Err(err) = stream.set_read_timeout(None) {
             let _ = err;
@@ -250,29 +234,8 @@ fn stream_events(stream: &mut TcpStream, engine: &Arc<Engine>, stop: &Arc<Atomic
     }
 }
 
-/// Opens the page only if no tab from a previous run has already polled us. A hidden tab stops all
-/// traffic by design, so it cannot be detected.
-fn open_browser_when_unclaimed(url: &str, saw_client: Arc<AtomicBool>, stop: Arc<AtomicBool>) {
-    let url = url.to_string();
-    std::thread::spawn(move || {
-        for _ in 0..20 {
-            if saw_client.load(Ordering::Relaxed) {
-                log::line("browser tab already open; not launching another");
-                return;
-            }
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if saw_client.load(Ordering::Relaxed) {
-            return;
-        }
-        open_page(&url);
-    });
-}
-
-/// Opens a url in the default browser. The tray's "open MicDeck" and the startup launch both come here.
+/// Opens a url in the default browser. The tray's "打开 MicDeck" row and double-click come here; startup
+/// never launches a page on its own.
 pub(crate) fn open_page(url: &str) {
     #[cfg(windows)]
     {

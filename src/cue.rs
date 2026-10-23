@@ -6,7 +6,9 @@
 
 use std::sync::LazyLock;
 
+#[cfg(not(test))]
 use windows::core::PCWSTR;
+#[cfg(not(test))]
 use windows::Win32::Media::Audio::{PlaySoundW, SND_ASYNC, SND_MEMORY, SND_NODEFAULT};
 
 const RATE: u32 = 48_000;

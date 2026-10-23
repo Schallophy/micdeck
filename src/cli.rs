@@ -32,7 +32,6 @@ pub enum Command {
     /// `tray` adds the notification-icon entry, which is what owns the process lifetime.
     Web {
         port: u16,
-        browser: bool,
         settings: Option<String>,
         limit: Option<f64>,
         tray: bool,
@@ -66,7 +65,9 @@ const USAGE_LINES: &[&str] = &[
     "  --capture-loopback [--device s] whole render endpoint (control path)",
     "  --engine --line <id|name>      run the real engine on one line: optional --pid source, --mic-device",
     "                                 --line may be repeated to run two lines at once",
-    "  --web [--port n] [--no-browser]  run the product: engine, restored settings, UI on 127.0.0.1",
+    "  --web [--port n]              run the product: engine, restored settings, UI on 127.0.0.1",
+    "                                 no page is opened at startup: double-click the tray icon, or",
+    "                                 paste the url the run logs",
     "  --tray                           add the notification-icon entry; implies --web, and is what",
     "                                   running the program with no arguments at all means",
     "                                   with --seconds n the run stops itself after n seconds",
@@ -80,11 +81,11 @@ const USAGE_LINES: &[&str] = &[
 ];
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
-    // No arguments is how the product is started: web UI, tray entry, open the page, stay up.
+    // No arguments is how the product is started: web UI, tray entry, stay up. The page waits for the
+    // user: the tray's double-click (or the logged url).
     if args.is_empty() {
         return Ok(Command::Web {
             port: 8765,
-            browser: true,
             settings: None,
             limit: None,
             tray: true,
@@ -98,7 +99,6 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     let mut web = false;
     let mut tray = false;
     let mut port: u16 = 8765;
-    let mut browser = true;
     let mut settings_path: Option<String> = None;
     let mut seconds_given = false;
     let mut icon_target: Option<String> = None;
@@ -150,7 +150,6 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 icon_target = Some(target);
             }
             "--settings" => settings_path = Some(next(a)?),
-            "--no-browser" => browser = false,
             "--port" => {
                 port = next(a)?
                     .parse::<u16>()
@@ -227,7 +226,6 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
     if web {
         return Ok(Command::Web {
             port,
-            browser,
             settings: settings_path,
             limit: if seconds_given { Some(seconds) } else { None },
             tray,
@@ -290,20 +288,18 @@ mod tests {
     }
 
     /// Starting the program with nothing is how a double-click arrives, and it means the product: server
-    /// plus tray, browser opened, no self-imposed deadline.
+    /// plus tray, no self-imposed deadline. The page is not launched; the tray owns that entry.
     #[test]
     fn no_arguments_means_the_product_with_a_tray_entry() {
         let command = parse(&[]).expect("no arguments must be a valid run");
         match command {
             Command::Web {
                 port,
-                browser,
                 settings,
                 limit,
                 tray,
             } => {
                 assert_eq!(port, 8765);
-                assert!(browser, "a first run should show the page");
                 assert!(tray);
                 assert!(settings.is_none());
                 assert_eq!(limit, None);
@@ -315,28 +311,26 @@ mod tests {
     #[test]
     fn asking_for_the_tray_asks_for_the_server_too() {
         match parse(&["--tray"]).unwrap() {
-            Command::Web { tray, browser, .. } => {
-                assert!(tray);
-                assert!(browser, "--tray alone still opens the page");
-            }
+            Command::Web { tray, .. } => assert!(tray),
             other => panic!("expected a web run, got {other:?}"),
         }
-        // The port may be moved, and a smoke run may close the browser and bound itself.
-        match parse(&["--tray", "--port", "9001", "--no-browser", "--seconds", "7"]).unwrap() {
+        // The port may be moved, and a smoke run may bound itself.
+        match parse(&["--tray", "--port", "9001", "--seconds", "7"]).unwrap() {
             Command::Web {
-                port,
-                browser,
-                limit,
-                tray,
-                ..
+                port, limit, tray, ..
             } => {
                 assert_eq!(port, 9001);
-                assert!(!browser);
                 assert_eq!(limit, Some(7.0));
                 assert!(tray);
             }
             other => panic!("expected a web run, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_removed_browser_flag_is_refused() {
+        // Nothing opens the page at startup any more, so the flag would be a lie if it were accepted.
+        assert!(parse(&["--tray", "--no-browser"]).is_err());
     }
 
     /// `--web` without `--seconds` runs until the tray or Ctrl+C ends it; a `--seconds` that was not
