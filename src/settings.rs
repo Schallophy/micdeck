@@ -1,6 +1,5 @@
-//! `%APPDATA%\MicDeck\settings.json`, carried over once from the pre-rename MicFuse file. Wire format is
-//! camelCase, a value that did not change is not written, and the legacy `lineRoutes` list folds into
-//! `sources` on read.
+//! `%APPDATA%\MicDeck\settings.json`. Wire format is camelCase, a value that did not change is not
+//! written, and the legacy `lineRoutes` list folds into `sources` on read.
 //!
 //! Nothing is picked for the user; a remembered source is its executable path, not a pid.
 
@@ -114,36 +113,7 @@ impl Default for Settings {
 impl Settings {
     /// The file this product keeps its state in.
     pub fn load() -> Settings {
-        Self::load_with_carry_over(&store_path(), &previous_store_path())
-    }
-
-    /// Loads `store`, copying `previous` into it first when `store` does not exist yet. The old file is
-    /// left where it is: it belongs to the build that was called MicFuse, which may still be run.
-    fn load_with_carry_over(store: &Path, previous: &Path) -> Settings {
-        if !store.exists() && previous.exists() {
-            if let Some(dir) = store.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            match std::fs::copy(previous, store) {
-                Ok(_) => log::line(&format!(
-                    "settings: carried over from '{}'",
-                    previous.display()
-                )),
-                Err(err) => {
-                    // Copying failed but the old file may still be readable: use it for this run and keep
-                    // writing to the new store, so the move completes on the next edit instead of losing
-                    // the topology.
-                    log::line(&format!(
-                        "settings: carry-over from '{}' failed: {err}",
-                        previous.display()
-                    ));
-                    let mut loaded = Self::load_at(previous);
-                    loaded.store = store.to_path_buf();
-                    return loaded;
-                }
-            }
-        }
-        Self::load_at(store)
+        Self::load_at(&store_path())
     }
 
     pub fn load_at(path: &Path) -> Settings {
@@ -320,12 +290,6 @@ impl Settings {
 /// user actually has.
 pub fn store_path() -> PathBuf {
     app_data_dir().join("MicDeck").join("settings.json")
-}
-
-/// Where the state lived while the product was called MicFuse. Read once, when the new store does not
-/// exist yet: the file holds the user's topology, and a rename must not cost them their lines.
-fn previous_store_path() -> PathBuf {
-    app_data_dir().join("MicFuse").join("settings.json")
 }
 
 fn app_data_dir() -> PathBuf {
@@ -573,34 +537,5 @@ mod tests {
         settings.set_sources(&[(two, "", 1.0, &[]), (one, "", 1.0, &[])]);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"sentinel\":true}");
         let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_renamed_store_carries_the_old_file_over_once() {
-        let base = std::env::temp_dir().join(format!("micdeck-carry-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let old = base.join("MicFuse").join("settings.json");
-        let new = base.join("MicDeck").join("settings.json");
-        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
-        std::fs::write(
-            &old,
-            r#"{"micId":"{0.0.1.00000000}.{mic}","micGain":0.5,"lines":[{"id":7,"deviceId":"dev","label":"TeamSpeak"}],"sources":[]}"#,
-        )
-        .unwrap();
-
-        let loaded = Settings::load_with_carry_over(&new, &old);
-        assert_eq!(loaded.store, new, "edits are written to the new store");
-        assert_eq!(loaded.mic_id, "{0.0.1.00000000}.{mic}");
-        assert_eq!(loaded.mic_gain, 0.5);
-        assert_eq!(loaded.lines.len(), 1);
-        assert_eq!(loaded.lines[0].id, 7);
-        assert!(new.exists(), "the old file was copied, not moved");
-        assert!(old.exists(), "the old file is left alone");
-
-        // The copy is the store now: a later load reads it rather than the old file.
-        std::fs::write(&old, "{}").unwrap();
-        let again = Settings::load_with_carry_over(&new, &old);
-        assert_eq!(again.mic_id, "{0.0.1.00000000}.{mic}");
-        let _ = std::fs::remove_dir_all(&base);
     }
 }
