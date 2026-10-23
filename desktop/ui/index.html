@@ -31,7 +31,6 @@
   /* 只读界面：指针操作不应带走任何文字选区；输入框和报错文案仍要能选中复制。 */
   input[type=text],textarea,.banner{-webkit-user-select:text;user-select:text}
   .wrap{max-width:1180px;margin:0 auto;padding:14px 24px 48px}
-  .recovery{display:flex;justify-content:flex-end;margin:-4px 0 16px}
   .grid{display:grid;grid-template-columns:minmax(470px,1.35fr) minmax(360px,1fr);gap:18px;align-items:start}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 20px;margin-bottom:18px}
   .card h2{font-size:13px;letter-spacing:.4px;text-transform:uppercase;color:var(--muted);
@@ -177,10 +176,6 @@
 <div class="wrap">
   <div id="banners"></div>
 
-  <div class="recovery">
-    <button class="btn primary" id="engineRestart">重启引擎</button>
-  </div>
-
   <div class="grid">
     <div>
       <section class="card" id="micCard">
@@ -242,7 +237,7 @@ const HUES = [18, 172, 214, 42, 302, 96, 340, 262];
 const state = {
   running:false, sources:[], lines:[], outputs:[], status:null, previews:[],
   picker:[], pickerSig:'', pickerTimer:null,
-  restarting:false, busy:false, hotkey:'',
+  busy:false, hotkey:'',
   sig:'', lineSig:'', rows:new Map(), lineEls:new Map(), gainTimers:{}, gainDrafts:{}, micGainDraft:null, labelTimers:{}, labelDrafts:{}, lastBanners:''};
 // The page speaks the route table verbatim; only the wire changed. `api_request` answers with exactly
 // the JSON body the local server used to write, so a refused edit arrives as {error} rather than as a
@@ -795,20 +790,12 @@ $('addLine').onclick = async () => {
 // --- status, meters ---------------------------------------------------------------------------
 // There is no connection to report any more: the engine is this process, and a page that is on screen
 // is by definition talking to it. What is left to surface is a fault, and the error banner does that.
-function paintStatus(){
-  const s = state.status || {};
-  // Restart is a recovery action, not an apply button: only surface it when something is wrong.
-  $('engineRestart').style.display = (s.state === 'faulted' || state.restarting) ? '' : 'none';
-}
-
 function setState(s){
   state.running = !!s.running;
   state.sources = s.sources || [];
   state.lines = s.lines || [];
   state.previews = s.previews || [];
   state.status = s;
-  $('engineRestart').disabled = state.restarting;
-  paintStatus();
 
   renderLines();
   renderApps();
@@ -879,22 +866,6 @@ async function refreshState(){
     setState(await getJson('/api/state'));
   } catch (e) {}
 }
-
-$('engineRestart').onclick = async () => {
-  if (state.restarting) return;
-  const button = $('engineRestart');
-  state.restarting = true;
-  button.disabled = true;
-  button.textContent = '重启中…';
-  try {
-    const res = await post('/api/engine/restart', {});
-    if (res.error) alert(res.error);
-  } finally {
-    state.restarting = false;
-    button.textContent = '重启引擎';
-    await refreshState();
-  }
-};
 
 let micTimer = null;
 $('micGain').addEventListener('input', e => {
