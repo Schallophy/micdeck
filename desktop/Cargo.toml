@@ -5,6 +5,13 @@ edition = "2021"
 description = "MicDeck's desktop shell: the tray, the window and the commands behind it"
 license = "MIT"
 
+# The binary is the product, so it carries the product's name; the crate keeps its own so that
+# `cargo build -p micdeck-desktop` still says what is being built. The diagnostic CLI in the root
+# package gave up this name and is `micdeck-cli`.
+[[bin]]
+name = "micdeck"
+path = "src/main.rs"
+
 [dependencies]
 micdeck_lib = { package = "micdeck", path = ".." }
 tauri = { version = "2", features = [] }

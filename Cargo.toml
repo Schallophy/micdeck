@@ -13,7 +13,9 @@ name = "micdeck_lib"
 path = "src/lib.rs"
 
 [[bin]]
-name = "micdeck"
+# The product binary is the desktop shell's, and it is named `micdeck`; this one is the diagnostic
+# entry point, so it says so rather than shipping two binaries with the same name.
+name = "micdeck-cli"
 path = "src/main.rs"
 
 [dependencies]

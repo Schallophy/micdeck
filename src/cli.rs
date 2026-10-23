@@ -63,12 +63,12 @@ const USAGE_LINES: &[&str] = &[
     "  --exclude      with --capture-pid, capture everything except the target tree",
     "  --log <file>   also write the log to a file",
     "",
-    "  The product itself is micdeck-desktop: engine, window and tray in one binary.",
+    "  The product itself is micdeck: engine, window and tray in one binary. This one is micdeck-cli.",
 ];
 
 pub fn parse(args: &[String]) -> Result<Command, String> {
     // Nothing at all is a diagnostic run with no mode, not a product launch: the product is
-    // micdeck-desktop, and double-clicking this binary prints the usage.
+    // micdeck, and double-clicking this binary prints the usage.
     let mut pid: Option<u32> = None;
     let mut mic = false;
     let mut loopback = false;
@@ -238,7 +238,7 @@ mod tests {
         super::parse(&text.iter().map(|s| s.to_string()).collect::<Vec<_>>())
     }
 
-    /// The product is `micdeck-desktop` now. This binary with no arguments is a diagnostic run that
+    /// The product is `micdeck` now. This binary with no arguments is a diagnostic run that
     /// asked for nothing, which is an error and not a silent launch of something else.
     #[test]
     fn no_arguments_is_not_a_mode() {
