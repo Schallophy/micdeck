@@ -1,9 +1,9 @@
 //! The tray entry: the icon, the menu under it, and the reason the process stays alive.
 //!
-//! The owner is a real hidden window, not a message-only one: a popup menu needs an owner it can be
-//! foregrounded against, or an outside click never dismisses it. Nothing may hold the tray lock across
-//! `TrackPopupMenuEx` — it dispatches the measure and draw messages straight back into this file. The
-//! menu is owner-drawn because Windows paints themed menus light whatever the app theme is.
+//! The owner is a real hidden window, not a message-only one: [`crate::popup`] puts a foreground window
+//! on screen when the menu opens, and a window that cannot be foregrounded leaves the menu unable to see
+//! the click that should dismiss it. `show_menu` blocks the tray thread the way `TrackPopupMenuEx` did,
+//! which is what keeps one click from starting a second menu or a second engine restart.
 
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
@@ -12,23 +12,14 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use windows::core::{PCWSTR, Error as WindowsError};
-use windows::Win32::Foundation::{
-    COLORREF, FALSE, HWND, HINSTANCE, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM,
-};
-use windows::Win32::Graphics::Gdi::{
-    CreateFontIndirectW, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, GetDC,
-    GetTextExtentPoint32W, GetTextMetricsW, HBRUSH, HDC, HFONT, HGDIOBJ, ReleaseDC, SelectObject,
-    SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-    DT_SINGLELINE, DT_VCENTER,
-};
+use windows::Win32::Foundation::{FALSE, HWND, HINSTANCE, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::HBRUSH;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RRF_SUBKEY_WOW6464KEY,
 };
-use windows::Win32::UI::Controls::{DRAWITEMSTRUCT, MEASUREITEMSTRUCT, ODS_SELECTED, ODT_MENU};
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForWindow, SetProcessDpiAwarenessContext,
-    SystemParametersInfoForDpi,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetDoubleClickTime, RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_NOREPEAT,
@@ -38,20 +29,18 @@ use windows::Win32::UI::Shell::{
     NIM_SETVERSION, NOTIFYICONDATAW, NOTIFY_ICON_DATA_FLAGS,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, DispatchMessageW, GetMessageW, GetCursorPos, HICON, HMENU, IDC_ARROW, KillTimer,
-    LoadCursorW, MSG, MENUINFO, MF_OWNERDRAW, MIM_APPLYTOSUBMENUS, MIM_BACKGROUND, MIM_STYLE,
-    MNS_NOCHECK, NONCLIENTMETRICSW, PostMessageW, PostQuitMessage, RegisterClassExW,
-    SetForegroundWindow, SetMenuInfo, SetTimer, SPI_GETNONCLIENTMETRICS, TPM_BOTTOMALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, TranslateMessage, WM_APP, WM_CONTEXTMENU,
-    WM_DESTROY, WM_DRAWITEM, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE,
-    WM_NULL, WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, GetMessageW,
+    GetCursorPos, HICON, IDC_ARROW, KillTimer, LoadCursorW, MSG, PostMessageW,
+    PostQuitMessage, RegisterClassExW, SetTimer, TranslateMessage, WM_APP,
+    WM_CONTEXTMENU, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_RBUTTONUP, WM_SETTINGCHANGE, WM_TIMER, WNDCLASSEXW, WNDCLASS_STYLES, WS_EX_TOOLWINDOW,
+    WS_POPUP,
 };
 
 use crate::engine::Engine;
 use crate::log;
 use crate::platform::brand;
+use crate::popup;
 use crate::settings::Settings;
 use crate::tap;
 use crate::web;
@@ -85,35 +74,6 @@ const TAP_TICK_MS: u32 = 15;
 
 const CLASS: &str = "MicDeckTray";
 
-/// The two palettes `TrayApp.SyncMenuTheme` painted, as blue-first colour references.
-struct Palette {
-    background: COLORREF,
-    foreground: COLORREF,
-    hover: COLORREF,
-}
-
-const fn rgb(r: u32, g: u32, b: u32) -> COLORREF {
-    COLORREF((b << 16) | (g << 8) | r)
-}
-
-const DARK: Palette = Palette {
-    background: rgb(36, 35, 32),
-    foreground: rgb(243, 239, 230),
-    hover: rgb(46, 44, 41),
-};
-
-const LIGHT: Palette = Palette {
-    background: rgb(255, 255, 255),
-    foreground: rgb(31, 30, 29),
-    hover: rgb(246, 243, 236),
-};
-
-#[derive(Clone)]
-struct Item {
-    id: usize,
-    label: Vec<u16>,
-}
-
 struct Tray {
     hwnd: isize,
     engine: Arc<Engine>,
@@ -124,10 +84,7 @@ struct Tray {
     /// Set only by a bounded smoke run; the tick treats it as a shutdown request.
     deadline: Option<Instant>,
     icon: isize,
-    font: isize,
-    menu: isize,
-    background: isize,
-    items: Vec<Item>,
+    items: Vec<popup::Row>,
     dark: bool,
     running: bool,
     muted: bool,
@@ -186,31 +143,24 @@ pub fn run(
     let running = status.running;
     let muted = status.mic_muted;
     let icon = brand::hicon().ok_or_else(|| "could not build the tray icon".to_string())?;
-    let menu = unsafe { CreatePopupMenu() }.map_err(|err| format!("popup menu: {err}"))?;
     let items = vec![
-        Item {
+        popup::Row {
             id: ITEM_OPEN,
             label: wide("打开 MicDeck"),
         },
-        Item {
+        popup::Row {
             id: ITEM_MUTE,
             label: mute_label(muted),
         },
-        Item {
+        popup::Row {
             id: ITEM_RESTART,
             label: wide("重启引擎"),
         },
-        Item {
+        popup::Row {
             id: ITEM_EXIT,
             label: wide("退出"),
         },
     ];
-    unsafe {
-        for item in &items {
-            // Owner-draw items are given an id and no text: the label is ours to measure and paint.
-            let _ = AppendMenuW(menu, MF_OWNERDRAW, item.id, PCWSTR::null());
-        }
-    }
 
     let class = wide(CLASS);
     let instance = unsafe { GetModuleHandleW(PCWSTR::null()) }
@@ -256,15 +206,11 @@ pub fn run(
     .map_err(|err| format!("create tray window: {err}"))?;
 
     let dark = is_dark_theme();
-    let background = unsafe { CreateSolidBrush(palette_for(dark).background) };
-    unsafe { apply_menu_background(menu, background, dark) };
 
     let mut notify = notify_for(hwnd, icon, NIF_ICON | NIF_MESSAGE | NIF_TIP);
     write_tip(&mut notify, running, url);
     if unsafe { Shell_NotifyIconW(NIM_ADD, &notify) } == FALSE {
         unsafe {
-            let _ = DestroyMenu(menu);
-            let _ = DeleteObject(background.into());
             let _ = DestroyIcon(icon);
             let _ = DestroyWindow(hwnd);
         }
@@ -316,7 +262,6 @@ pub fn run(
         }
     };
 
-    let font = menu_font(hwnd);
     let deadline = limit_seconds.map(|seconds| Instant::now() + Duration::from_secs_f64(seconds));
     *TRAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Tray {
         hwnd: hwnd.0 as isize,
@@ -326,9 +271,6 @@ pub fn run(
         stopped,
         deadline,
         icon: icon.0 as isize,
-        font: font.map(|font| font.0 as isize).unwrap_or(0),
-        menu: menu.0 as isize,
-        background: background.0 as isize,
         items,
         dark,
         running,
@@ -364,15 +306,10 @@ pub fn run(
     }
 
     // The window is already gone by here (WM_DESTROY ended the loop); what is left is the shell's copy
-    // of the icon and the GDI objects this thread made for the menu.
+    // of the icon.
     unsafe {
         let _ = KillTimer(Some(hwnd), TIMER);
         let _ = Shell_NotifyIconW(NIM_DELETE, &notify);
-        let _ = DestroyMenu(menu);
-        if let Some(font) = font {
-            let _ = DeleteObject(font.into());
-        }
-        let _ = DeleteObject(background.into());
         let _ = DestroyIcon(icon);
     }
     *TRAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
@@ -386,8 +323,6 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match msg {
         ICON_MESSAGE => icon_message(hwnd, wparam, lparam),
         REBIND_MESSAGE => apply_rebind(),
-        WM_MEASUREITEM => measure_item(lparam),
-        WM_DRAWITEM => draw_item(lparam),
         WM_TIMER => match wparam.0 as usize {
             TIMER => tick(),
             TAP_TIMER => tap_tick(),
@@ -487,36 +422,31 @@ fn open_page() {
     }
 }
 
-fn show_menu(hwnd: HWND) {
-    // Everything the popup needs is copied out first: `TrackPopupMenuEx` blocks here while it dispatches
-    // the measure and draw messages back into this module, and the state lock must not be held across it.
-    let Some(menu) = with(|tray| tray.menu) else { return };
-    let command = unsafe {
-        let mut point = POINT::default();
-        let _ = GetCursorPos(&mut point);
-        // Foregrounding the owner is what lets an outside click dismiss the menu instead of being eaten.
-        let _ = SetForegroundWindow(hwnd);
-        let command = TrackPopupMenuEx(
-            HMENU(menu as *mut c_void),
-            // BOTTOMALIGN puts the menu's lower edge at the point, so it grows upward from the cursor
-            // instead of covering the icon and the taskbar the click came from.
-            TPM_RIGHTBUTTON.0 | TPM_RETURNCMD.0 | TPM_BOTTOMALIGN.0,
-            point.x,
-            point.y,
-            hwnd,
-            None,
-        );
-        // Without this nudge the shell leaves the menu's modal loop marked active and the next click on
-        // the desktop does nothing.
-        let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
-        command.0.max(0) as usize
+fn show_menu(owner: HWND) {
+    // One right-click can reach us twice, and the click that dismissed a menu is reported again as a
+    // fresh right-click on the icon, so a second sighting of either is the same gesture.
+    if popup::is_open() || popup::reopened_too_soon() {
+        return;
+    }
+    let mut point = POINT::default();
+    unsafe {
+        if GetCursorPos(&mut point).is_err() {
+            return;
+        }
+    }
+    // Everything the popup needs is copied out first: `popup::show` blocks here while it pumps this
+    // thread's messages, and the state lock must not be held across it.
+    let Some((rows, dark)) = with(|tray| (tray.items.clone(), tray.dark)) else {
+        return;
     };
-    match command {
-        ITEM_OPEN => open_page(),
-        ITEM_MUTE => toggle_mute(false),
-        ITEM_RESTART => restart_engine(),
-        ITEM_EXIT => unsafe {
-            let _ = DestroyWindow(hwnd);
+    let choice = popup::show(owner, point, rows, dark);
+    log::line(&format!("menu: closed with {choice:?}"));
+    match choice {
+        Some(ITEM_OPEN) => open_page(),
+        Some(ITEM_MUTE) => toggle_mute(false),
+        Some(ITEM_RESTART) => restart_engine(),
+        Some(ITEM_EXIT) => unsafe {
+            let _ = DestroyWindow(owner);
         },
         _ => {}
     }
@@ -714,108 +644,6 @@ fn mute_label(muted: bool) -> Vec<u16> {
     })
 }
 
-fn measure_item(lparam: LPARAM) {
-    let Some((hwnd, font)) = with(|tray| (tray.hwnd, tray.font)) else {
-        return;
-    };
-    let owner = hwnd_of(hwnd);
-    let dpi = unsafe { GetDpiForWindow(owner) }.max(96);
-    let pad_x = (6 * dpi as i32 / 96).max(2);
-    let pad_y = (3 * dpi as i32 / 96).max(1);
-    unsafe {
-        let hdc = GetDC(Some(owner));
-        let previous = if font == 0 {
-            HGDIOBJ::default()
-        } else {
-            SelectObject(hdc, HFONT(font as *mut c_void).into())
-        };
-        let mut metrics = TEXTMETRICW::default();
-        let has_metrics = GetTextMetricsW(hdc, &mut metrics).as_bool();
-        let mut widest = 0i32;
-        if let Some(tray) = TRAY.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).as_mut() {
-            for item in &tray.items {
-                let mut size = SIZE::default();
-                if GetTextExtentPoint32W(hdc, &item.label, &mut size).as_bool() {
-                    widest = widest.max(size.cx);
-                }
-            }
-        }
-        if font != 0 {
-            let _ = SelectObject(hdc, previous);
-        }
-        let _ = ReleaseDC(Some(owner), hdc);
-        let height = if has_metrics {
-            metrics.tmHeight
-        } else {
-            16 * dpi as i32 / 96
-        };
-        let item = &mut *(lparam.0 as *mut MEASUREITEMSTRUCT);
-        item.itemWidth = (widest + 2 * pad_x).max(1) as u32;
-        item.itemHeight = (height + 2 * pad_y).max(1) as u32;
-    }
-}
-
-fn draw_item(lparam: LPARAM) {
-    let Some(state) = with(|tray| (tray.font, tray.dark, tray.items.clone())) else {
-        return;
-    };
-    let (font, dark, items) = state;
-    unsafe {
-        let draw = &*(lparam.0 as *const DRAWITEMSTRUCT);
-        if draw.CtlType != ODT_MENU {
-            return;
-        }
-        let selected = (draw.itemState.0 & ODS_SELECTED.0) != 0;
-        let label = items
-            .iter()
-            .find(|item| item.id == draw.itemID as usize)
-            .map(|item| item.label.as_slice())
-            .unwrap_or(&[]);
-        paint_row(draw.hDC, &draw.rcItem, label, palette_for(dark), selected, font);
-    }
-}
-
-/// One menu row: the theme's background or hover fill, then the label in the theme's ink. Split out from
-/// the message handler so a test can drive it into an offscreen bitmap instead of trusting that the
-/// palette constants were read the right way round.
-unsafe fn paint_row(
-    hdc: HDC,
-    area: &RECT,
-    label: &[u16],
-    palette: &Palette,
-    selected: bool,
-    font: isize,
-) {
-    let brush = CreateSolidBrush(if selected {
-        palette.hover
-    } else {
-        palette.background
-    });
-    let _ = FillRect(hdc, area, brush);
-    let _ = DeleteObject(brush.into());
-    let previous = if font == 0 {
-        HGDIOBJ::default()
-    } else {
-        SelectObject(hdc, HFONT(font as *mut c_void).into())
-    };
-    let _ = SetBkMode(hdc, TRANSPARENT);
-    let _ = SetTextColor(hdc, palette.foreground);
-    // 6 px of horizontal padding; the row height already carries the 3 px.
-    let mut rect = *area;
-    rect.left += 6;
-    rect.right -= 6;
-    let mut text = label.to_vec();
-    let _ = DrawTextW(
-        hdc,
-        &mut text,
-        &mut rect,
-        DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX | DT_END_ELLIPSIS,
-    );
-    if font != 0 {
-        let _ = SelectObject(hdc, previous);
-    }
-}
-
 fn tick() {
     // One snapshot per tick: the tooltip and the menu row change only on a transition, and both exits
     // are noticed here. The page can toggle the microphone between two ticks; the engine's answer is
@@ -890,6 +718,8 @@ fn notify_for(
     }
 }
 
+/// The theme is re-read when the shell announces it, and the next menu that opens is drawn with the
+/// value stored here.
 fn refresh_theme() {
     let dark = is_dark_theme();
     let flipped = with(|tray| {
@@ -900,66 +730,12 @@ fn refresh_theme() {
         true
     })
     .unwrap_or(false);
-    if !flipped {
-        return;
-    }
-    let Some((menu, previous)) = with(|tray| (tray.menu, tray.background)) else {
-        return;
-    };
-    unsafe {
-        let brush = CreateSolidBrush(palette_for(dark).background);
-        apply_menu_background(HMENU(menu as *mut c_void), brush, dark);
-        // The menu has already been repainted with the new brush, so the one it held is now ours to free.
-        let _ = DeleteObject(HBRUSH(previous as *mut c_void).into());
-        with(|tray| tray.background = brush.0 as isize);
-    }
-    log::line(&format!(
-        "tray: theme switched to {}",
-        if dark { "dark" } else { "light" }
-    ));
-}
-
-unsafe fn apply_menu_background(menu: HMENU, brush: HBRUSH, dark: bool) {
-    let info = MENUINFO {
-        cbSize: std::mem::size_of::<MENUINFO>() as u32,
-        fMask: MIM_BACKGROUND | MIM_STYLE | MIM_APPLYTOSUBMENUS,
-        // Owner-draw items take the whole row, and no check gutter is reserved for a menu that never
-        // shows one.
-        dwStyle: MNS_NOCHECK,
-        cyMax: 0,
-        hbrBack: brush,
-        dwContextHelpID: 0,
-        dwMenuData: 0,
-    };
-    if SetMenuInfo(menu, &info).is_err() {
+    if flipped {
         log::line(&format!(
-            "tray: menu background could not be set for the {} theme",
+            "tray: theme switched to {}",
             if dark { "dark" } else { "light" }
         ));
     }
-}
-
-/// The font the shell itself uses for menus, at the dpi of the display this window is on.
-fn menu_font(hwnd: HWND) -> Option<HFONT> {
-    let dpi = unsafe { GetDpiForWindow(hwnd) };
-    let mut metrics = NONCLIENTMETRICSW {
-        cbSize: std::mem::size_of::<NONCLIENTMETRICSW>() as u32,
-        ..Default::default()
-    };
-    let ok = unsafe {
-        SystemParametersInfoForDpi(
-            SPI_GETNONCLIENTMETRICS.0,
-            metrics.cbSize,
-            Some(&mut metrics as *mut NONCLIENTMETRICSW as *mut c_void),
-            0,
-            dpi,
-        )
-    };
-    if ok.is_err() {
-        return None;
-    }
-    let font = unsafe { CreateFontIndirectW(&metrics.lfMenuFont) };
-    (!font.is_invalid()).then_some(font)
 }
 
 /// `HKCU\...\Themes\Personalize\AppsUseLightTheme == 0`, asked when the menu opens and on
@@ -979,14 +755,6 @@ fn is_dark_theme() -> bool {
         )
     };
     error.0 == 0 && value == 0
-}
-
-fn palette_for(dark: bool) -> &'static Palette {
-    if dark {
-        &DARK
-    } else {
-        &LIGHT
-    }
 }
 
 /// Word-for-word what `BuildTooltip` produced, line break included.
@@ -1019,114 +787,6 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, CreateDIBSection, DIB_RGB_COLORS,
-        DeleteDC,
-    };
-
-    /// Paints one row into a 32-bit buffer with the default font and hands the pixels back in the order
-    /// they were drawn. `font: 0` is deliberate: it keeps the test independent of whatever menu font this
-    /// machine happens to use, while still exercising the fill, the text colour and the padding.
-    fn paint_probe(palette: &Palette, selected: bool, label: &str) -> Vec<(u8, u8, u8)> {
-        let (width, height) = (200i32, 28i32);
-        unsafe {
-            let mut info = BITMAPINFO::default();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = width;
-            info.bmiHeader.biHeight = -height;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            info.bmiHeader.biCompression = BI_RGB.0;
-            let mut bits: *mut c_void = std::ptr::null_mut();
-            let Ok(dib) = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0) else {
-                panic!("the probe bitmap could not be created");
-            };
-            let dc = CreateCompatibleDC(None);
-            let previous = SelectObject(dc, dib.into());
-            let area = RECT {
-                left: 0,
-                top: 0,
-                right: width,
-                bottom: height,
-            };
-            paint_row(dc, &area, &wide(label), palette, selected, 0);
-            let pixels = std::slice::from_raw_parts(bits as *const u32, (width * height) as usize);
-            let out = pixels
-                .iter()
-                .map(|p| {
-                    (
-                        // A 32-bit DIB pixel is 0xAARRGGBB; a COLORREF is 0x00BBGGRR. Reading the pixel
-                        // as red-first is what makes the two comparable.
-                        ((p >> 16) & 0xff) as u8,
-                        ((p >> 8) & 0xff) as u8,
-                        (p & 0xff) as u8,
-                    )
-                })
-                .collect();
-            let _ = SelectObject(dc, previous);
-            let _ = DeleteDC(dc);
-            let _ = DeleteObject(dib.into());
-            out
-        }
-    }
-
-    fn matches(pixel: (u8, u8, u8), colour: COLORREF) -> bool {
-        pixel == (
-            (colour.0 & 0xff) as u8,
-            ((colour.0 >> 8) & 0xff) as u8,
-            ((colour.0 >> 16) & 0xff) as u8,
-        )
-    }
-
-    #[test]
-    fn a_colourref_puts_blue_in_the_high_byte() {
-        // `TrayApp.cs` wrote Color.FromArgb(36, 35, 32); COLORREF is (b << 16) | (g << 8) | r.
-        assert_eq!(rgb(36, 35, 32).0, (32 << 16) | (35 << 8) | 36);
-        assert_eq!(rgb(217, 119, 87).0, (87 << 16) | (119 << 8) | 217);
-    }
-
-    #[test]
-    fn the_dark_row_is_filled_with_the_theme_and_inked_with_the_foreground() {
-        let pixels = paint_probe(&DARK, false, "重启引擎");
-        // The 6 px padding on the left and the far right edge are untouched fill.
-        assert!(matches(pixels[0], DARK.background));
-        assert!(matches(pixels[27 * 200 + 199], DARK.background));
-        let painted = pixels.iter().filter(|p| !matches(**p, DARK.background)).count();
-        assert!(painted > 30, "the label should cover more than {painted} pixels");
-        let brightest = pixels
-            .iter()
-            .map(|p| p.0.max(p.1).max(p.2))
-            .max()
-            .unwrap_or(0);
-        assert!(
-            brightest > 200,
-            "the ink is the light foreground, not a dark colour: {brightest}"
-        );
-    }
-
-    #[test]
-    fn a_selected_row_is_filled_with_the_hover_colour() {
-        let pixels = paint_probe(&DARK, true, "退出");
-        assert!(matches(pixels[0], DARK.hover));
-        assert!(matches(pixels[27 * 200 + 199], DARK.hover));
-        let painted = pixels.iter().filter(|p| !matches(**p, DARK.hover)).count();
-        assert!(painted > 10, "the short label still drew {painted} pixels");
-    }
-
-    #[test]
-    fn the_light_row_stays_dark_on_white() {
-        let pixels = paint_probe(&LIGHT, false, "打开 MicDeck");
-        assert!(matches(pixels[0], LIGHT.background));
-        let darkest = pixels
-            .iter()
-            .map(|p| p.0.min(p.1).min(p.2))
-            .min()
-            .unwrap_or(255);
-        assert!(
-            darkest < 80,
-            "the ink is the dark foreground, not white on white: {darkest}"
-        );
-    }
 
     #[test]
     fn the_tooltip_says_what_the_csharp_tray_said() {

@@ -6,6 +6,8 @@ pub mod engine;
 pub mod hotkey;
 pub mod log;
 pub mod platform;
+#[cfg(windows)]
+pub mod popup;
 pub mod settings;
 #[cfg(windows)]
 pub mod tap;
