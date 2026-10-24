@@ -24,6 +24,26 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": [
+      "nsis"
+    ],
+    "icon": [
+      "icons/icon.ico"
+    ],
+    "publisher": "Schallophy",
+    "copyright": "© 2026 Schallophy",
+    "category": "Utility",
+    "shortDescription": "应用音频与麦克风混音，送进虚拟麦克风",
+    "longDescription": "MicDeck 把选定应用的音频和麦克风混成一路，送进虚拟声卡，供 TeamSpeak、QQ 等语音软件当作麦克风使用。",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese"
+        ],
+        "displayLanguageSelector": false
+      }
+    }
   }
 }
