@@ -48,36 +48,22 @@ async fn icon(pid: u32) -> Value {
     api::icon(pid)
 }
 
-/// The main page's "设置…" entry.
-#[tauri::command]
-fn open_settings(app: tauri::AppHandle) {
-    show_settings(&app);
-}
-
-/// Raises the settings window, building it the first time. It is not in `tauri.conf.json` on purpose:
-/// a declared-but-hidden window still costs a WebView2 renderer for as long as the tray lives.
+/// Shows the settings page in the main window. A second window would be a second WebView2 renderer for
+/// a page the user leaves after a few seconds; swapping the document keeps one window and one page
+/// history, and the page's own back button returns.
 fn show_settings(app: &tauri::AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
-        if let Some(window) = handle.get_webview_window("settings") {
-            let _ = window.show();
-            let _ = window.set_focus();
+        let Some(window) = handle.get_webview_window("main") else {
             return;
-        }
-        let built = tauri::WebviewWindowBuilder::new(
-            &handle,
-            "settings",
-            tauri::WebviewUrl::App("settings.html".into()),
-        )
-        .title("MicDeck 设置")
-        .inner_size(460.0, 560.0)
-        .min_inner_size(420.0, 360.0)
-        .build();
-        match built {
-            Ok(window) => {
-                let _ = window.set_focus();
-            }
-            Err(err) => log::line(&format!("settings window: {err}")),
+        };
+        let _ = window.show();
+        let _ = window.set_focus();
+        // A relative navigation from inside the document: `window.url()` can still be `about:blank`
+        // before the first page commits, so building the target from it would go nowhere.
+        match window.eval("location.assign('settings.html')") {
+            Ok(()) => log::line("settings: page"),
+            Err(err) => log::line(&format!("settings page: {err}")),
         }
     });
 }
@@ -190,7 +176,7 @@ fn main() {
 
     let built = tauri::Builder::default()
         .manage(hub)
-        .invoke_handler(tauri::generate_handler![api_request, icon, open_settings])
+        .invoke_handler(tauri::generate_handler![api_request, icon])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api: guard, .. } = event {
                 // Closing the window is not quitting: the tray and the engine stay up, and the page's

@@ -22,8 +22,11 @@
   body{margin:0;background:var(--bg);color:var(--ink);
        -webkit-user-select:none;user-select:none;
        font:14px/1.55 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
-       padding:18px 20px 28px}
-  h1{font-size:17px;margin:0 0 14px;letter-spacing:.2px;font-weight:650}
+       padding:16px 20px 28px}
+  .wrap{max-width:760px;margin:0 auto}
+  .top{display:flex;align-items:center;gap:12px;margin:0 0 14px}
+  h1{font-size:17px;margin:0;letter-spacing:.2px;font-weight:650}
+  .back{font-size:13px;padding:5px 10px}
   .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:12px}
   .card h2{font-size:13px;margin:0 0 10px;color:var(--muted);font-weight:600;letter-spacing:.3px}
   .row{display:flex;align-items:center;gap:10px;min-height:30px}
@@ -44,7 +47,11 @@
 </style>
 </head>
 <body>
-<h1>设置</h1>
+<div class="wrap">
+<div class="top">
+  <button class="btn ghost back" id="back" title="返回混音台">← 返回</button>
+  <h1>设置</h1>
+</div>
 
 <section class="card">
   <h2>启动</h2>
@@ -77,6 +84,8 @@
   </div>
   <p class="hint" id="hotkeyHint">点击后按下组合键；Esc 取消，Backspace 清除。左/右 Ctrl、Alt、Shift、Win 可单独作为轻点绑定。</p>
 </section>
+
+</div>
 
 <script>
 const tauri = window.__TAURI__;
@@ -260,6 +269,8 @@ window.addEventListener('keyup', e => {
     if (armed && label) save(label);
   }
 }, true);
+
+document.getElementById('back').addEventListener('click', () => { location.href = 'index.html'; });
 
 refresh();
 refreshAutostart();

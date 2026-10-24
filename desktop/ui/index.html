@@ -902,7 +902,7 @@ $('micToggle').addEventListener('click', () => {
   post('/api/mic/mute', { muted: on }).catch(() => {});
 });
 
-$('openSettings').addEventListener('click', () => invoke('open_settings'));
+$('openSettings').addEventListener('click', () => { location.href = 'settings.html'; });
 
 (async function init(){
   $('micToggle').innerHTML = MIC_SVG;
