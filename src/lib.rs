@@ -1,5 +1,6 @@
 pub mod api;
 pub mod app;
+pub mod autostart;
 pub mod bench;
 pub mod cli;
 pub mod cue;

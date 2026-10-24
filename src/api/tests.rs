@@ -32,6 +32,28 @@ fn post(engine: &Arc<Engine>, settings: &Arc<Mutex<Settings>>, path: &str, body:
     handle(engine, settings, "POST", path, body)
 }
 
+/// Reading is safe; writing is not, so the refusal path is the one worth pinning: an edit without the
+/// flag must stop before the registry is touched.
+#[test]
+fn autostart_refuses_an_edit_that_does_not_say_which_way() {
+    let engine = engine();
+    let (settings, path) = settings("autostart");
+    let before = crate::autostart::status().expect("read").enabled;
+    let empty = post(&engine, &settings, "/api/autostart", "{}");
+    let wrong = post(&engine, &settings, "/api/autostart", r#"{"enabled":"yes"}"#);
+    assert!(empty.get("error").is_some(), "empty body: {empty}");
+    assert!(wrong.get("error").is_some(), "wrong type: {wrong}");
+    assert_eq!(
+        crate::autostart::status().expect("read").enabled,
+        before,
+        "a refused edit changed the startup entry"
+    );
+    let read = get(&engine, &settings, "/api/autostart");
+    assert!(read.get("enabled").is_some(), "GET: {read}");
+    assert!(read.get("command").is_some(), "GET: {read}");
+    let _ = std::fs::remove_file(path);
+}
+
 #[test]
 fn the_state_envelope_carries_every_key_the_page_reads() {
     // This list is the contract with `ui/index.html`. Renaming a field on the engine side without

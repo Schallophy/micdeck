@@ -55,6 +55,13 @@ struct MicMuteRequest {
     muted: bool,
 }
 
+/// The startup entry is a registry fact, not a setting in our store, so it is read where it lives.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutostartRequest {
+    enabled: bool,
+}
+
 /// Likewise required: an empty string is the explicit "no shortcut", so a body that forgets the field
 /// must not be read as "disable the shortcut".
 #[derive(Debug, Deserialize)]
@@ -155,6 +162,16 @@ fn dispatch(
     }
     if method == "GET" && path == "/api/devices" {
         return Ok(list_devices());
+    }
+    if method == "GET" && path == "/api/autostart" {
+        let status = crate::autostart::status()?;
+        return Ok(json!({ "enabled": status.enabled, "command": status.command }));
+    }
+    if method == "POST" && path == "/api/autostart" {
+        let request: AutostartRequest = from_json(body)?;
+        let exe = std::env::current_exe().map_err(|err| format!("current exe: {err}"))?;
+        let status = crate::autostart::set_enabled(&exe, request.enabled)?;
+        return Ok(json!({ "enabled": status.enabled, "command": status.command }));
     }
 
     if method == "POST" && path == "/api/lines/add" {
