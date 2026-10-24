@@ -56,6 +56,20 @@
 </section>
 
 <section class="card">
+  <h2>监听</h2>
+  <div class="row">
+    <label class="label" for="monitorDevice">输出设备</label>
+    <select id="monitorDevice"><option value="">选择输出设备…</option></select>
+  </div>
+  <div class="row">
+    <label class="label" for="monitorGain">监听音量</label>
+    <input type="range" id="monitorGain" min="-60" max="12" step="0.5">
+    <span class="val" id="monitorGainVal">0.0 dB</span>
+  </div>
+  <p class="hint">监听把线路的混音播到这台设备上，不影响送进虚拟线的声音。在线路卡上用耳机图标开关。</p>
+</section>
+
+<section class="card">
   <h2>快捷键</h2>
   <div class="row">
     <span class="label">麦克风开关</span>
@@ -98,6 +112,51 @@ autostart.addEventListener('change', async () => {
   } finally {
     autostart.disabled = false;
   }
+});
+
+// --- listening ----------------------------------------------------------------------------------
+// The device and the volume are stored settings; whether a line is being listened to is runtime state,
+// so this page only ever edits the first two.
+const monitorDevice = document.getElementById('monitorDevice');
+const monitorGain = document.getElementById('monitorGain');
+const monitorGainVal = document.getElementById('monitorGainVal');
+const gainToDb = g => (g <= 0 ? -60 : 20 * Math.log10(g));
+const dbToGain = db => (db <= -59.5 ? 0 : Math.pow(10, db / 20));
+const escapeHtml = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function paintMonitorGain(){
+  const db = Number(monitorGain.value);
+  monitorGainVal.textContent = (db <= -59.5 ? '−∞' : (db > 0 ? '+' : '') + db.toFixed(1)) + ' dB';
+}
+async function refreshMonitor(){
+  try {
+    const devices = await getJson('/api/devices');
+    monitorDevice.innerHTML = '<option value="">选择输出设备…</option>' +
+      (devices.outputs || []).map(o => `<option value="${escapeHtml(o.id)}">${escapeHtml(o.name)}</option>`).join('');
+    const config = await getJson('/api/monitor');
+    if (config.deviceId) monitorDevice.value = config.deviceId;
+    const db = Math.max(-60, Math.min(12, gainToDb(config.gain || 0)));
+    monitorGain.value = String(db);
+    paintMonitorGain();
+  } catch (e) {}
+}
+monitorDevice.addEventListener('change', async () => {
+  const deviceId = monitorDevice.value;
+  if (!deviceId) return;
+  monitorDevice.disabled = true;
+  try {
+    const res = await post('/api/monitor/output', { deviceId });
+    if (res.error) alert(res.error);
+  } finally {
+    monitorDevice.disabled = false;
+  }
+});
+monitorGain.addEventListener('input', paintMonitorGain);
+let monitorGainTimer = null;
+monitorGain.addEventListener('input', () => {
+  clearTimeout(monitorGainTimer);
+  // Captured at event time: the label may have moved on, the value that was dragged to is what counts.
+  const gain = dbToGain(Number(monitorGain.value));
+  monitorGainTimer = setTimeout(() => { post('/api/monitor/gain', { gain }); }, 150);
 });
 
 // --- shortcut recorder --------------------------------------------------------------------------
@@ -204,6 +263,7 @@ window.addEventListener('keyup', e => {
 
 refresh();
 refreshAutostart();
+refreshMonitor();
 </script>
 </body>
 </html>

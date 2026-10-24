@@ -16,7 +16,9 @@ use super::clock::Clock;
 use super::meter::{peak_of, LiveMeter};
 use super::mixer::Mixer;
 use super::ring::{SourceRing, RING_CAPACITY_FRAMES};
-use super::status::{EngineStatus, Identity, LineInfo, PreviewInfo, RouteInfo, SourceInfo};
+use super::status::{
+    EngineStatus, Identity, LineInfo, MonitorInfo, PreviewInfo, RouteInfo, SourceInfo,
+};
 use crate::log;
 use crate::platform::{
     self, Capture, Direction, Endpoint, FillBlock, OnFrames, Sink, Source, StreamOptions,
@@ -24,6 +26,8 @@ use crate::platform::{
 
 /// The microphone is a permanent feed with a fixed id; its routes are what the user edits.
 pub const MIC_FEED_ID: u32 = 0;
+/// The only source on a monitor bus: the tap of the line being listened to.
+const MONITOR_TAP_ID: u32 = u32::MAX;
 /// +12 dB, the ceiling the slider maps to; above unity the limiter is doing the work.
 pub const MAX_GAIN: f32 = 4.0;
 /// The queue a render endpoint is asked for. Not a latency setting — what counts is what it grants.
@@ -72,6 +76,9 @@ struct Line {
     name: String,
     label: String,
     bus: Arc<Mixer>,
+    /// Set while this line is being monitored: the mixed block is copied here and a second sink plays it on
+    /// a physical output. The tap is the line's own mix, so routing and gains need no second topology.
+    tap: Arc<Mutex<Option<Arc<SourceRing>>>>,
     sink: Option<Sink>,
     state: String,
     error: String,
@@ -93,6 +100,18 @@ impl Line {
     }
 }
 
+/// The line being listened to, played on a physical output. The bus has one source — the line's tap ring —
+/// so every edit to the line's own mix reaches the speakers without another copy of the topology.
+struct Monitor {
+    line_id: u32,
+    device_id: String,
+    name: String,
+    bus: Arc<Mixer>,
+    sink: Option<Sink>,
+    /// The requested volume; the sink's callback ramps toward it, so dragging the slider cannot step.
+    gain: Arc<AtomicU32>,
+}
+
 struct Mic {
     device_id: String,
     name: String,
@@ -109,6 +128,7 @@ struct Mic {
 
 struct World {
     wants: Vec<SourceWant>,
+    monitor: Option<Monitor>,
     lines: Vec<Line>,
     previews: HashMap<u32, Preview>,
     preview_lease_ns: u64,
@@ -164,12 +184,36 @@ fn meter_only_callback(meter: Arc<LiveMeter>) -> OnFrames {
 
 /// A line's render block: mix, and never hand the endpoint a half-written block. A panic here is a bug in
 /// the mixer, so it is silenced for one block, counted, and reported instead of being repeated as garbage.
-fn fill_callback(bus: Arc<Mixer>) -> FillBlock {
+fn fill_callback(bus: Arc<Mixer>, tap: Arc<Mutex<Option<Arc<SourceRing>>>>) -> FillBlock {
     Box::new(move |destination: &mut [f32]| {
         let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bus.mix(destination)));
         if mixed.is_err() {
             destination.fill(0.0);
             bus.note_backstop();
+        }
+        // Cloned out before writing so the audio thread never holds this lock across a ring write.
+        let tap = tap.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+        if let Some(ring) = tap {
+            ring.write(destination);
+        }
+    })
+}
+
+/// The monitor's sink callback. The tap ring has a reader of its own, so the two endpoints' clocks are
+/// absorbed exactly the way every line absorbs a source's; the volume ramps instead of stepping so the
+/// slider cannot click.
+fn monitor_fill(bus: Arc<Mixer>, gain: Arc<AtomicU32>) -> FillBlock {
+    let mut current = 0.0f32;
+    Box::new(move |destination: &mut [f32]| {
+        let mixed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| bus.mix(destination)));
+        if mixed.is_err() {
+            destination.fill(0.0);
+            bus.note_backstop();
+        }
+        let target = f32::from_bits(gain.load(Ordering::Relaxed));
+        for sample in destination.iter_mut() {
+            current += (target - current) * 0.002;
+            *sample *= current;
         }
     })
 }
@@ -195,6 +239,7 @@ impl Engine {
         let engine = Arc::new(Self {
             world: Mutex::new(World {
                 wants: Vec::new(),
+                monitor: None,
                 lines: Vec::new(),
                 previews: HashMap::new(),
                 preview_lease_ns: 0,
@@ -265,6 +310,24 @@ impl Engine {
             status.mic_muted = world.mic.muted;
             status.mic_level = world.mic.meter.level();
             status.mic_hold = world.mic.meter.hold();
+            if let Some(monitor) = &world.monitor {
+                let alive = monitor.sink.as_ref().is_some_and(|sink| sink.is_alive());
+                let tap = monitor.bus.stats(MONITOR_TAP_ID);
+                status.monitor = MonitorInfo {
+                    line_id: monitor.line_id,
+                    device_id: monitor.device_id.clone(),
+                    name: monitor.name.clone(),
+                    gain: f32::from_bits(monitor.gain.load(Ordering::Relaxed)),
+                    running: alive,
+                    error: if alive {
+                        String::new()
+                    } else {
+                        "监听输出已断开".to_string()
+                    },
+                    buffered_ms: tap.as_ref().map_or(0.0, |stats| stats.buffered_ms),
+                    starved_frames: tap.as_ref().map_or(0, |stats| stats.starved_frames),
+                };
+            }
             status.previews = world
                 .previews
                 .values()
@@ -391,6 +454,7 @@ impl Engine {
             device_id: endpoint.id.clone(),
             name: endpoint.name.clone(),
             label: String::new(),
+            tap: Arc::new(Mutex::new(None)),
             bus,
             sink: None,
             state: "starting".to_string(),
@@ -419,7 +483,7 @@ impl Engine {
         let sink = Sink::start(
             endpoint,
             line_options(),
-            fill_callback(line.bus.clone()),
+            fill_callback(line.bus.clone(), line.tap.clone()),
         )
         .map_err(|err| format!("线路启动失败: {err}"))?;
         let facts = sink.facts();
@@ -459,6 +523,13 @@ impl Engine {
 
     pub fn remove_line(&self, line_id: u32) {
         let mut world = self.world();
+        if world
+            .monitor
+            .as_ref()
+            .is_some_and(|monitor| monitor.line_id == line_id)
+        {
+            self.stop_monitor(&mut world);
+        }
         let Some(index) = world.lines.iter().position(|line| line.id == line_id) else {
             return;
         };
@@ -579,6 +650,7 @@ impl Engine {
                     name: String::new(),
                     label: line.label.clone(),
                     bus: line.bus.clone(),
+                    tap: line.tap.clone(),
                     sink: None,
                     state: "faulted".to_string(),
                     error: format!("切换输出失败: {reason}; 回滚失败: {rollback}"),
@@ -1436,6 +1508,76 @@ impl Engine {
 
     // --- shutdown ----------------------------------------------------------------------------
 
+    /// Plays one line's mix on a physical output. The tap goes on the line before the sink starts, so the
+    /// first block the endpoint asks for already has something to read.
+    pub fn start_monitor(&self, line_id: u32, device_id: &str, gain: f32) -> Result<(), String> {
+        let endpoint = platform::find_endpoint(Direction::Render, device_id)?;
+        let mut world = self.world();
+        let tap = match world.lines.iter().find(|line| line.id == line_id) {
+            Some(line) => line.tap.clone(),
+            None => return Err("线路不存在".to_string()),
+        };
+        self.stop_monitor(&mut world);
+        let bus = Arc::new(Mixer::new(
+            platform::SAMPLE_RATE,
+            platform::CHANNELS,
+            "MON",
+            self.clock.clone(),
+        ));
+        let ring = SourceRing::new(
+            platform::CHANNELS,
+            platform::SAMPLE_RATE,
+            RING_CAPACITY_FRAMES,
+            self.clock.clone(),
+        );
+        bus.attach_source(ring.clone(), MONITOR_TAP_ID, 1.0);
+        let gain = Arc::new(AtomicU32::new(gain.clamp(0.0, MAX_GAIN).to_bits()));
+        let sink = Sink::start(&endpoint, line_options(), monitor_fill(bus.clone(), gain.clone()))
+            .map_err(|err| format!("监听输出启动失败: {err}"))?;
+        *tap.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(ring);
+        world.monitor = Some(Monitor {
+            line_id,
+            device_id: endpoint.id.clone(),
+            name: endpoint.name.clone(),
+            bus,
+            sink: Some(sink),
+            gain,
+        });
+        log::line(&format!("monitor: line {line_id} -> '{}'", endpoint.name));
+        Ok(())
+    }
+
+    pub fn stop_monitor_now(&self) {
+        let mut world = self.world();
+        self.stop_monitor(&mut world);
+    }
+
+    fn stop_monitor(&self, world: &mut World) {
+        let Some(mut monitor) = world.monitor.take() else {
+            return;
+        };
+        if let Some(line) = world.lines.iter().find(|line| line.id == monitor.line_id) {
+            *line.tap.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        }
+        if let Some(mut sink) = monitor.sink.take() {
+            sink.stop();
+        }
+        log::line("monitor off");
+    }
+
+    pub fn set_monitor_gain(&self, gain: f32) {
+        let world = self.world();
+        if let Some(monitor) = &world.monitor {
+            monitor
+                .gain
+                .store(gain.clamp(0.0, MAX_GAIN).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn monitor_line_id(&self) -> Option<u32> {
+        self.world().monitor.as_ref().map(|monitor| monitor.line_id)
+    }
+
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let mut world = self.world();
@@ -1445,6 +1587,7 @@ impl Engine {
             }
         }
         world.previews.clear();
+        self.stop_monitor(&mut world);
         let ids: Vec<u32> = world.wants.iter().map(|want| want.id).collect();
         for id in ids {
             self.detach_feed(&mut world, id, "", "");

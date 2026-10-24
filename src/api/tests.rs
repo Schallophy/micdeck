@@ -54,6 +54,76 @@ fn autostart_refuses_an_edit_that_does_not_say_which_way() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Listening is a runtime mode: turning it off with no line is a no-op, and asking for a line that does
+/// not exist must not create a sink anywhere.
+#[test]
+fn monitor_off_is_a_no_op_and_a_missing_line_is_refused() {
+    let engine = engine();
+    let (settings, path) = settings("monitor");
+    assert_eq!(get(&engine, &settings, "/api/monitor")["lineId"], 0);
+    let off = post(&engine, &settings, "/api/monitor", r#"{"lineId":0}"#);
+    assert_eq!(off["ok"], true, "{off}");
+    let missing = post(&engine, &settings, "/api/monitor", r#"{"lineId":9}"#);
+    assert!(missing.get("error").is_some(), "missing line: {missing}");
+    assert_eq!(engine.monitor_line_id(), None);
+    let no_device = post(&engine, &settings, "/api/monitor/output", "{}");
+    assert!(no_device.get("error").is_some(), "{no_device}");
+    let _ = std::fs::remove_file(path);
+}
+
+/// On demand only: opens two sinks on a spare endpoint and taps a process that never renders audio, so
+/// what reaches the device is silence by construction. The question is mechanical — does the line's tap
+/// actually fill the monitor's reader — and the answer is the tap's fill level over a second.
+#[test]
+#[ignore = "needs audio devices: cargo test --lib -- --ignored"]
+fn the_monitor_plays_the_line_tap() {
+    use crate::platform::{self, Direction};
+    let endpoints = platform::list_endpoints(Direction::Render).expect("render endpoints");
+    let Some(endpoint) = endpoints
+        .iter()
+        .find(|endpoint| endpoint.name.contains("CABLE In 16ch"))
+        .cloned()
+    else {
+        eprintln!("skipped: no spare 'CABLE In 16ch' endpoint");
+        return;
+    };
+    let engine = engine();
+    let (settings, store) = settings("monitor-live");
+    let mut child = std::process::Command::new("powershell")
+        .args(["-WindowStyle", "Hidden", "-Command", "Start-Sleep 20"])
+        .spawn()
+        .expect("silent source process");
+    let line = post(&engine, &settings, "/api/lines/add", &format!(r#"{{"deviceId":"{}"}}"#, endpoint.id));
+    let line_id = line["lineId"].as_u64().expect("line") as u32;
+    let source = post(&engine, &settings, "/api/sources/add", &format!(r#"{{"pid":{}}}"#, child.id()));
+    let source_id = source["id"].as_u64().unwrap_or(0) as u32;
+    assert!(source_id > 0, "source: {source}");
+    let routed = post(&engine, &settings, "/api/routes/app",
+        &format!(r#"{{"id":{source_id},"lineId":{line_id},"on":true}}"#));
+    assert!(routed.get("error").is_none(), "route: {routed}");
+    let output = post(&engine, &settings, "/api/monitor/output", &format!(r#"{{"deviceId":"{}"}}"#, endpoint.id));
+    assert!(output.get("error").is_none(), "output: {output}");
+    let started = post(&engine, &settings, "/api/monitor", &format!(r#"{{"lineId":{line_id}}}"#));
+    assert!(started.get("error").is_none(), "monitor: {started}");
+
+    let mut samples = Vec::new();
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        let state = get(&engine, &settings, "/api/state");
+        samples.push(state["monitor"]["bufferedMs"].as_f64().unwrap_or(0.0));
+    }
+    let running = get(&engine, &settings, "/api/state")["monitor"]["running"].as_bool().unwrap_or(false);
+    let monitor = engine.monitor_line_id();
+    engine.stop();
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = std::fs::remove_file(store);
+    assert_eq!(monitor, Some(line_id));
+    assert!(running, "the monitor sink died: {samples:?}");
+    let fed = samples.iter().filter(|sample| **sample > 4.0).count();
+    assert!(fed >= 8, "the tap never fed the monitor: {samples:?}");
+}
+
 #[test]
 fn the_state_envelope_carries_every_key_the_page_reads() {
     // This list is the contract with `ui/index.html`. Renaming a field on the engine side without
@@ -71,6 +141,7 @@ fn the_state_envelope_carries_every_key_the_page_reads() {
         "micRoutes",
         "starvedFrames",
         "lines",
+        "monitor",
         "sources",
         "previews",
     ];

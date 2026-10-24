@@ -93,6 +93,22 @@ pub struct LineInfo {
     pub source_ids: Vec<u32>,
 }
 
+/// The line being listened to on a physical output, if any.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MonitorInfo {
+    pub line_id: u32,
+    pub device_id: String,
+    pub name: String,
+    pub gain: f32,
+    pub running: bool,
+    pub error: String,
+    /// Fill level of the line's tap as the monitor's reader sees it: the number that says whether the tap
+    /// is actually feeding the second endpoint.
+    pub buffered_ms: f64,
+    pub starved_frames: u64,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EngineStatus {
@@ -111,6 +127,7 @@ pub struct EngineStatus {
     /// Sum of deadline misses across every source on every line.
     pub starved_frames: u64,
     pub lines: Vec<LineInfo>,
+    pub monitor: MonitorInfo,
     pub sources: Vec<SourceInfo>,
     /// Non-empty only while the add-source list is open: one capture per candidate app.
     pub previews: Vec<PreviewInfo>,

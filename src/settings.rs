@@ -81,6 +81,11 @@ pub struct Settings {
     pub lines: Vec<LineSetting>,
     #[serde(default)]
     pub mic_routes: Vec<u32>,
+    /// The output the monitor plays through; empty means the user has not picked one yet.
+    #[serde(default)]
+    pub monitor_device_id: String,
+    #[serde(default = "one")]
+    pub monitor_gain: f32,
     #[serde(default)]
     pub sources: Vec<SourceSetting>,
     /// Legacy: read once, folded into `sources`, then dropped from the file.
@@ -103,6 +108,8 @@ impl Default for Settings {
             hotkey: default_hotkey(),
             lines: Vec::new(),
             mic_routes: Vec::new(),
+            monitor_device_id: String::new(),
+            monitor_gain: 1.0,
             sources: Vec::new(),
             line_routes: None,
             store: PathBuf::new(),
@@ -216,6 +223,16 @@ impl Settings {
         for source in self.sources.iter_mut() {
             source.lines.retain(|id| kept.contains(id));
         }
+        self.save();
+    }
+
+    pub fn set_monitor_output(&mut self, device_id: &str, gain: f32) {
+        let gain = gain.clamp(0.0, crate::engine::MAX_GAIN);
+        if self.monitor_device_id == device_id && (self.monitor_gain - gain).abs() < f32::EPSILON {
+            return;
+        }
+        self.monitor_device_id = device_id.to_string();
+        self.monitor_gain = gain;
         self.save();
     }
 

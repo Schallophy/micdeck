@@ -602,6 +602,7 @@ function chipHtml(lineId, s){
 }
 
 const MIC_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 4a3 3 0 0 1 3 3v5a3 3 0 0 1-6 0V7a3 3 0 0 1 3-3z"/><path d="M6 11a6 6 0 0 0 12 0"/><path d="M12 17v3"/></svg>';
+const HEADPHONE_SVG = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 15v-3a8 8 0 0 1 16 0v3"/><path d="M4 15h3v5H5a1 1 0 0 1-1-1z"/><path d="M20 15h-3v5h2a1 1 0 0 0 1-1z"/></svg>';
 
 function waitingChipHtml(lineId, s){
   return `<span class="chip wait"><span class="cname">${escapeHtml(sourceLabel(s))}</span><span class="wtage">待接入</span>` +
@@ -615,6 +616,8 @@ function lineCardHtml(l){
     return s ? chipHtml(l.id, s) : '';
   }).filter(Boolean).join('');
   const micOn = ids.includes(0);
+  const active = state.status && state.status.monitor ? state.status.monitor.lineId : 0;
+  const monitored = active === l.id;
   const waiting = state.sources
     .filter(s => !sourceAlive(s) && (s.lines || []).includes(l.id))
     .map(s => waitingChipHtml(l.id, s)).join('');
@@ -624,6 +627,8 @@ function lineCardHtml(l){
         placeholder="备注（可选）" aria-label="线路备注">
       <button class="mbtn${micOn ? ' on' : ''}" data-line="${l.id}" aria-pressed="${micOn}"
         title="${micOn ? '已送入此线路，点击断开' : '送入此线路'}">${MIC_SVG}</button>
+      <button class="mbtn${monitored ? ' on' : ''}" data-monitor="${l.id}" aria-pressed="${monitored}"
+        title="${monitored ? '正在监听这条线路，点击停止' : '把这条线路的混音播到本机（在设置里选输出设备）'}">${HEADPHONE_SVG}</button>
       <button class="btn ghost lre" data-line="${l.id}" ${l.state === 'faulted' ? '' : 'hidden'}>重启</button>
       <button class="btn ghost lx" data-line="${l.id}" title="移除线路">×</button>
     </div>
@@ -638,9 +643,11 @@ function lineCardHtml(l){
 function lineSigOf(){
   const l = state.lines.map(x =>
     `${x.id}:${x.deviceId}:${x.state}:${(x.sourceIds || []).join(',')}`).join('|');
+  const monitor = state.status && state.status.monitor ? state.status.monitor.lineId : 0;
   const waiting = state.sources.filter(s => !sourceAlive(s))
     .map(s => `${s.id}:${(s.lines || []).join(',')}`).join(',');
-  return l + '#' + state.outputs.map(o => o.id).join(',') + '#mic' + [...micRouteIds()].join(',') + '#w' + waiting;
+  return l + '#' + state.outputs.map(o => o.id).join(',') + '#mic' + [...micRouteIds()].join(',')
+    + '#m' + monitor + '#w' + waiting;
 }
 
 function renderLines(){
@@ -770,6 +777,15 @@ $('lineCards').addEventListener('change', async e => {
   if (r.error) { alert(r.error); await refreshState(); }
 });
 $('lineCards').addEventListener('click', async e => {
+  const hp = e.target.closest('[data-monitor]');
+  if (hp) {
+    const lineId = Number(hp.dataset.monitor);
+    const active = state.status && state.status.monitor ? state.status.monitor.lineId : 0;
+    const r = await post('/api/monitor', { lineId: active === lineId ? 0 : lineId });
+    if (r.error) alert(r.error);
+    await refreshState();
+    return;
+  }
   const mb = e.target.closest('.mbtn');
   if (mb) { await toggleRoute('mic', mb.dataset.line, !mb.classList.contains('on')); return; }
   const re = e.target.closest('.lre');

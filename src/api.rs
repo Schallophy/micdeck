@@ -55,6 +55,25 @@ struct MicMuteRequest {
     muted: bool,
 }
 
+/// Monitoring is a runtime state, not a stored wish: 0 means "stop listening".
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorRequest {
+    line_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorOutputRequest {
+    device_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitorGainRequest {
+    gain: f32,
+}
+
 /// The startup entry is a registry fact, not a setting in our store, so it is read where it lives.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +185,55 @@ fn dispatch(
     if method == "GET" && path == "/api/autostart" {
         let status = crate::autostart::status()?;
         return Ok(json!({ "enabled": status.enabled, "command": status.command }));
+    }
+    if method == "GET" && path == "/api/monitor" {
+        let settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        return Ok(json!({
+            "deviceId": settings.monitor_device_id,
+            "gain": settings.monitor_gain,
+            "lineId": engine.monitor_line_id().unwrap_or(0),
+        }));
+    }
+    if method == "POST" && path == "/api/monitor" {
+        let request: MonitorRequest = from_json(body)?;
+        if request.line_id == 0 {
+            engine.stop_monitor_now();
+            return Ok(ok());
+        }
+        let (device, gain) = {
+            let settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            (settings.monitor_device_id.clone(), settings.monitor_gain)
+        };
+        if device.trim().is_empty() {
+            return Err("先在设置里选择监听输出设备".to_string());
+        }
+        engine.start_monitor(request.line_id, &device, gain)?;
+        return Ok(ok());
+    }
+    if method == "POST" && path == "/api/monitor/output" {
+        let request: MonitorOutputRequest = from_json(body)?;
+        if request.device_id.trim().is_empty() {
+            return Err("deviceId required".to_string());
+        }
+        let gain = {
+            let mut settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let gain = settings.monitor_gain;
+            settings.set_monitor_output(&request.device_id, gain);
+            gain
+        };
+        if let Some(line_id) = engine.monitor_line_id() {
+            // A different endpoint is a different stream: the tap stays, the sink is rebuilt around it.
+            engine.start_monitor(line_id, &request.device_id, gain)?;
+        }
+        return Ok(ok());
+    }
+    if method == "POST" && path == "/api/monitor/gain" {
+        let request: MonitorGainRequest = from_json(body)?;
+        let mut settings = settings.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device = settings.monitor_device_id.clone();
+        settings.set_monitor_output(&device, request.gain);
+        engine.set_monitor_gain(request.gain);
+        return Ok(ok());
     }
     if method == "POST" && path == "/api/autostart" {
         let request: AutostartRequest = from_json(body)?;
