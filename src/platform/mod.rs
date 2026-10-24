@@ -105,6 +105,8 @@ pub use win::devices::{
 #[cfg(windows)]
 pub use win::render::{FillBlock, Sink};
 #[cfg(windows)]
+pub use win::single::{acquire as single_instance, focus_existing, SingleInstance};
+#[cfg(windows)]
 pub use win::process::{
     alive as process_alive, name as process_name, path as process_path, self_pid, session_pids,
     ProcessFacts, processes_named,

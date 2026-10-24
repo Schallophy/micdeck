@@ -5,6 +5,7 @@ pub mod devices;
 pub mod icon;
 pub mod process;
 pub mod render;
+pub mod single;
 pub mod thread;
 
 use wasapi::{AudioClient, SharedModeEnginePeriod, WasapiError};

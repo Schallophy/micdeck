@@ -108,6 +108,29 @@ fn main() {
         log::init(&path.to_string_lossy());
     }
 
+    // A second double-click should raise the window that is already there instead of starting a second
+    // engine on the same endpoints. Test runs are exempt on purpose: `--settings`/`--seconds` exist to run
+    // beside the product, and one of them is what CI would use.
+    let _single = if options.settings.is_none() && options.seconds.is_none() {
+        match micdeck_lib::platform::single_instance() {
+            Ok(Some(guard)) => Some(guard),
+            Ok(None) => {
+                let focused = micdeck_lib::platform::focus_existing();
+                log::line(&format!(
+                    "another instance is running (window focused: {focused}); exiting"
+                ));
+                return;
+            }
+            Err(err) => {
+                // Not a reason to refuse to start: a missing guard is worse than a lost one.
+                log::line(&format!("single-instance guard unavailable: {err}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     // The restore talks to WASAPI, and `wasapi` initialises COM as multithreaded on whichever thread
     // asks it to. tao needs a pristine main thread to call `OleInitialize` on — with a saved topology
     // the restore alone poisoned it and the window could never be built (`RPC_E_CHANGED_MODE`). So the
