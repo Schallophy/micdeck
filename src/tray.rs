@@ -63,6 +63,7 @@ const ITEM_OPEN: usize = 1;
 const ITEM_RESTART: usize = 2;
 const ITEM_EXIT: usize = 3;
 const ITEM_MUTE: usize = 4;
+const ITEM_SETTINGS: usize = 5;
 
 /// `RegisterHotKey` ids are per window, not global; one is all this process needs.
 const HOTKEY_ID: i32 = 1;
@@ -78,6 +79,8 @@ struct Tray {
     settings: Arc<Mutex<Settings>>,
     /// Shows the window. The shell owns it, so the tray only knows how to ask.
     on_open: Arc<dyn Fn() + Send + Sync>,
+    /// Shows the settings window, same arrangement.
+    on_settings: Arc<dyn Fn() + Send + Sync>,
     /// Set only by a bounded smoke run; the tick treats it as a shutdown request.
     deadline: Option<Instant>,
     icon: isize,
@@ -123,12 +126,14 @@ fn hwnd_of(value: isize) -> HWND {
 }
 
 /// Runs the tray until its menu says quit or `limit_seconds` elapses. `on_open` is what the "打开
-/// MicDeck" row and the double-click do; the shell that owns the window supplies it.
+/// MicDeck" row and the double-click do, `on_settings` what the "设置…" row does; the shell that owns
+/// the windows supplies both.
 pub fn run(
     engine: Arc<Engine>,
     settings: Arc<Mutex<Settings>>,
     limit_seconds: Option<f64>,
     on_open: impl Fn() + Send + Sync + 'static,
+    on_settings: impl Fn() + Send + Sync + 'static,
 ) -> Result<(), String> {
     // Before any window is created or any metric is read, or the menu font and the icon size come back
     // for the wrong display. It fails harmlessly when a manifest already decided this.
@@ -144,6 +149,10 @@ pub fn run(
         popup::Row {
             id: ITEM_OPEN,
             label: wide("打开 MicDeck"),
+        },
+        popup::Row {
+            id: ITEM_SETTINGS,
+            label: wide("设置…"),
         },
         popup::Row {
             id: ITEM_MUTE,
@@ -183,7 +192,8 @@ pub fn run(
         ));
     }
 
-    let name = wide("MicDeck");
+    // Not "MicDeck": the shell finds our main window by that title, and this one is never shown.
+    let name = wide("MicDeckTray");
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -265,6 +275,7 @@ pub fn run(
         engine,
         settings,
         on_open: Arc::new(on_open),
+        on_settings: Arc::new(on_settings),
         deadline,
         icon: icon.0 as isize,
         items,
@@ -417,6 +428,11 @@ fn open_page() {
     with(|tray| (tray.on_open)());
 }
 
+/// The "设置…" row: same hand-off, to the other window.
+fn open_settings_window() {
+    with(|tray| (tray.on_settings)());
+}
+
 fn show_menu(owner: HWND) {
     // One right-click can reach us twice, and the click that dismissed a menu is reported again as a
     // fresh right-click on the icon, so a second sighting of either is the same gesture.
@@ -438,6 +454,7 @@ fn show_menu(owner: HWND) {
     log::line(&format!("menu: closed with {choice:?}"));
     match choice {
         Some(ITEM_OPEN) => open_page(),
+        Some(ITEM_SETTINGS) => open_settings_window(),
         Some(ITEM_MUTE) => toggle_mute(false),
         Some(ITEM_RESTART) => restart_engine(),
         Some(ITEM_EXIT) => unsafe {

@@ -48,6 +48,40 @@ async fn icon(pid: u32) -> Value {
     api::icon(pid)
 }
 
+/// The main page's "设置…" entry.
+#[tauri::command]
+fn open_settings(app: tauri::AppHandle) {
+    show_settings(&app);
+}
+
+/// Raises the settings window, building it the first time. It is not in `tauri.conf.json` on purpose:
+/// a declared-but-hidden window still costs a WebView2 renderer for as long as the tray lives.
+fn show_settings(app: &tauri::AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Some(window) = handle.get_webview_window("settings") {
+            let _ = window.show();
+            let _ = window.set_focus();
+            return;
+        }
+        let built = tauri::WebviewWindowBuilder::new(
+            &handle,
+            "settings",
+            tauri::WebviewUrl::App("settings.html".into()),
+        )
+        .title("MicDeck 设置")
+        .inner_size(460.0, 560.0)
+        .min_inner_size(420.0, 360.0)
+        .build();
+        match built {
+            Ok(window) => {
+                let _ = window.set_focus();
+            }
+            Err(err) => log::line(&format!("settings window: {err}")),
+        }
+    });
+}
+
 
 /// `--settings <file>` keeps a test instance off the live store, `--seconds <n>` bounds a smoke run and
 /// `--log <file>` records it. Everything else is a usage error: a double-click has no arguments at all
@@ -156,7 +190,7 @@ fn main() {
 
     let built = tauri::Builder::default()
         .manage(hub)
-        .invoke_handler(tauri::generate_handler![api_request, icon])
+        .invoke_handler(tauri::generate_handler![api_request, icon, open_settings])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api: guard, .. } = event {
                 // Closing the window is not quitting: the tray and the engine stay up, and the page's
@@ -209,6 +243,21 @@ fn start_pushing(handle: tauri::AppHandle) {
     });
 }
 
+/// A closure that raises one of the shell's windows from any thread. Window calls must reach the main
+/// thread, so each one is posted there with its own pair of handle clones.
+fn shower(handle: tauri::AppHandle, label: &'static str) -> impl Fn() + Send + Sync + 'static {
+    move || {
+        let closer = handle.clone();
+        let on_thread = handle.clone();
+        let _ = closer.run_on_main_thread(move || {
+            if let Some(window) = on_thread.get_webview_window(label) {
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        });
+    }
+}
+
 /// The tray owns the process's other half: its menu's 退出 ends the run, and its "打开 MicDeck" is what
 /// brings the window back. It runs on its own thread with its own message loop, which is how
 /// `micdeck_lib::tray` was written.
@@ -216,18 +265,10 @@ fn start_tray(handle: tauri::AppHandle, hub: Hub, seconds: Option<f64>) {
     let limit = seconds.filter(|seconds| *seconds > 0.0);
     let opener = handle.clone();
     std::thread::spawn(move || {
-        let to_show = opener.clone();
-        let shown = move || {
-            let closer = to_show.clone();
-            let on_thread = to_show.clone();
-            let _ = closer.run_on_main_thread(move || {
-                if let Some(window) = on_thread.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
-                }
-            });
-        };
-        if let Err(err) = tray::run(hub.engine, hub.settings, limit, shown) {
+        let shown = shower(opener.clone(), "main");
+        let to_settings = opener.clone();
+        let settings = move || show_settings(&to_settings);
+        if let Err(err) = tray::run(hub.engine, hub.settings, limit, shown, settings) {
             log::line(&format!("tray failed: {err}"));
         }
         // The tray ended — by its menu, by a deadline, or by failing — and it is the only thing that
